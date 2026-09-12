@@ -1,0 +1,67 @@
+# spn-client
+
+A hardened Python client for archive.org's availability API and Save Page Now
+(SPN2) — the pieces that are easy to get wrong when you actually run this
+against archive.org at any volume:
+
+- **Process-wide rate pacing with a circuit breaker.** archive.org throttles
+  per IP, not per thread or per endpoint. A naive per-thread backoff (or none
+  at all) looks fine in testing and then silently stops archiving anything
+  the first time it's run concurrently or against a busy queue.
+- **Both submission modes.** Anonymous `GET /save/<url>` (capture runs inline,
+  answer comes back as a redirect) and S3-key-authenticated `POST /save`
+  (capture is queued, answer comes back as a `job_id` you poll for).
+- **An explicit outcome vocabulary.** `submitted` is not `archived`. This
+  library only ever reports `archived: True` alongside a real snapshot URL
+  that came back from archive.org — never as a synonym for "we asked."
+- **Staleness checking**, so callers can skip re-archiving a URL that already
+  has a recent-enough snapshot.
+
+Every non-obvious piece of behavior in `client.py` is a documented response to
+a specific, dated, measured incident against the real archive.org API — not
+a guess.
+
+## Install
+
+```bash
+pip install spn-client
+```
+
+## Usage
+
+```python
+import spn_client
+
+result = spn_client.check("https://example.com/some-page")
+if result["archived"] is False or result.get("snapshot_stale"):
+    submission = spn_client.submit(
+        "https://example.com/some-page",
+        access_key=ACCESS_KEY,   # optional — omit for anonymous, lower-rate submission
+        secret_key=SECRET_KEY,
+    )
+    if submission["job_id"]:
+        # authenticated path: poll for the real outcome
+        status = spn_client.check_job_status(
+            submission["job_id"], access_key=ACCESS_KEY, secret_key=SECRET_KEY
+        )
+```
+
+Call `spn_client.reset_rate_limit_state()` once at the start of each
+independent run/process if you're running this as a long-lived worker —
+the pacing/breaker state is process-wide and intentionally does not reset
+itself, so a breaker tripped by one run would otherwise silently degrade
+the next.
+
+## What this doesn't do
+
+This is the archive.org client only — it has no opinion about:
+- What staleness policy is right for your use case (`stale_days` is always a
+  caller-supplied parameter)
+- How you track which URLs you've already archived (that's a caller-side
+  ledger/cache concern)
+- Batch-loop concerns like a progress heartbeat or a wall-clock budget across
+  many submissions — those depend on your own operational needs
+
+## License
+
+MIT
