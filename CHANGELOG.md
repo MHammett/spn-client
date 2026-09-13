@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+Landing a change and shipping a release are two separate decisions here —
+see `[Unreleased]` below. Changes accumulate there until the maintainer
+decides a batch is tested and coherent enough to become a real version;
+see `AGENTS.md` if you're an AI coding agent about to add an entry here.
+
+## [Unreleased]
+
 ## [0.3.1] — 2026-09-13
 
 A senior-engineer audit pass: security, reliability, and packaging hardening,

@@ -151,6 +151,11 @@ Issues this project has filed or commented on upstream, with what it found:
   — `error:no-captures` is a real SPN2 status code absent from the SPN2 docs
   above; found live, added to `categorize_job_error()` in 0.2.1.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) — and [AGENTS.md](AGENTS.md) if an AI
+coding agent is doing some or all of the work.
+
 ## License
 
 MIT

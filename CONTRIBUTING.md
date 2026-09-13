@@ -4,6 +4,11 @@ This is a small, single-maintainer project — I review PRs on my own schedule,
 not on a support-ticket clock. That said, real contributions are genuinely
 welcome; this file exists to make that easy rather than to gatekeep it.
 
+If you're an AI coding agent (or being directed by one), read
+[AGENTS.md](AGENTS.md) too — it covers a couple of things specific to
+automated contributions, most importantly that landing a change here is
+never the same thing as releasing one.
+
 ## One thing worth knowing before you touch logic
 
 Most of the non-obvious behavior in `client.py` exists because of a specific,
