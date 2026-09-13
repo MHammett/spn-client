@@ -1121,8 +1121,17 @@ def system_status(timeout=15, access_key=None, secret_key=None):
 #: code, not a retry contract, and a code absent from this table (or absent
 #: entirely, which happens — see ``check_job_status``) means "unknown", not
 #: "permanent". Treat "unknown" as transient-leaning if a caller must choose.
+#:
+#: The docs are also demonstrably incomplete: a live capture 2026-09-13
+#: returned ``error:no-captures`` ("could not capture this URL because it
+#: was unreachable") for an ordinary, definitely-reachable URL — a code
+#: absent from the fetched docs entirely. Added below on the strength of
+#: that one observation, not the docs; expect more codes like it to surface
+#: over time; they will correctly categorize as unknown (``None``) until
+#: they do.
 _JOB_ERROR_CATEGORIES = {
     "error:bad-gateway": "transient",
+    "error:no-captures": "transient",
     "error:bad-request": "permanent",
     "error:bandwidth-limit-exceeded": "quota_exhausted",
     "error:blocked": "permanent",

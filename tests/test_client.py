@@ -1369,6 +1369,9 @@ class TestJobErrorCategorization:
         assert wayback.categorize_job_error("error:bad-gateway") == "transient"
         assert wayback.categorize_job_error("error:gateway-timeout") == "transient"
         assert wayback.categorize_job_error("error:cannot-fetch") == "transient"
+        # Observed live 2026-09-13, absent from archive.org's own fetched
+        # docs entirely — see the comment above _JOB_ERROR_CATEGORIES.
+        assert wayback.categorize_job_error("error:no-captures") == "transient"
 
     def test_a_quota_exhausted_failure_is_categorized(self):
         assert (
