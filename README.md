@@ -16,6 +16,18 @@ against archive.org at any volume:
   that came back from archive.org — never as a synonym for "we asked."
 - **Staleness checking**, so callers can skip re-archiving a URL that already
   has a recent-enough snapshot.
+- **Submissions are paced and breaker-protected too**, at archive.org's own
+  documented capture-endpoint limits (7/min authenticated, 3/min anonymous)
+  — not just the availability check.
+- **Categorized capture failures.** archive.org's SPN2 API documents ~30
+  specific error codes; `check_job_status()` sorts each into `"permanent"`
+  (retrying won't help), `"transient"` (worth trying again), or
+  `"quota_exhausted"` (back off the whole run, not just this URL) via
+  `categorize_job_error()`.
+- **The rest of the documented capture options**, exposed as optional
+  keyword arguments on `submit()`: screenshots, outlink availability,
+  skipping the first-capture check, JS render timeout, and login credentials
+  for pages behind a form.
 
 Every non-obvious piece of behavior in `client.py` is a documented response to
 a specific, dated, measured incident against the real archive.org API — not
@@ -51,6 +63,32 @@ independent run/process if you're running this as a long-lived worker —
 the pacing/breaker state is process-wide and intentionally does not reset
 itself, so a breaker tripped by one run would otherwise silently degrade
 the next.
+
+### Handling a failed capture
+
+```python
+status = spn_client.check_job_status(job_id, access_key=ACCESS_KEY, secret_key=SECRET_KEY)
+if status["state"] == "failed":
+    category = status["retry_category"]  # "permanent" / "transient" / "quota_exhausted" / None
+    if category == "quota_exhausted":
+        ...  # stop submitting new URLs this run, not just this one
+    elif category != "permanent":
+        ...  # worth another attempt later (also covers the unknown/None case)
+```
+
+### Optional capture options
+
+```python
+spn_client.submit(
+    url,
+    access_key=ACCESS_KEY, secret_key=SECRET_KEY,
+    capture_screenshot=True,       # -> status["screenshot_url"] once the job succeeds
+    outlinks_availability=True,    # -> status["outlinks"]
+    skip_first_archive=True,
+    js_behavior_timeout=15,        # seconds, 0-30 (archive.org's default is 5)
+    target_username="user", target_password="pass",  # pages behind a login form
+)
+```
 
 ## What this doesn't do
 

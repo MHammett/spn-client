@@ -10,6 +10,7 @@ from spn_client.client import (
     ARCHIVE_SUBMITTED,
     DEFAULT_STALE_DAYS,
     capture_capacity,
+    categorize_job_error,
     check,
     check_job_status,
     rate_limited_out,
@@ -20,7 +21,7 @@ from spn_client.client import (
     system_status,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "ARCHIVE_ARCHIVED",
@@ -32,6 +33,7 @@ __all__ = [
     "ARCHIVE_SUBMITTED",
     "DEFAULT_STALE_DAYS",
     "capture_capacity",
+    "categorize_job_error",
     "check",
     "check_job_status",
     "rate_limited_out",

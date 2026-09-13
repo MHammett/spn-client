@@ -117,6 +117,17 @@ _MIN_INTERVAL_SECONDS = 3.0
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_SECONDS = 5.0
 
+# archive.org's SPN2 API docs (fetched 2026-09-13) document explicit capture
+# limits distinct from the availability API's own (undocumented, empirically
+# worse — see above) throttle: "Max captures/minute: 7 (authenticated), 3
+# (anonymous)". _MIN_INTERVAL_SECONDS (20/min) is not conservative enough for
+# either tier on its own, so a capture request additionally requires this
+# wider interval — layered on the same shared clock, not a second one, so a
+# submit() still backs off every other call in flight the same way a 429
+# anywhere else does.
+_ANONYMOUS_SUBMIT_INTERVAL_SECONDS = 20.0  # 3/min
+_AUTHENTICATED_SUBMIT_INTERVAL_SECONDS = 60.0 / 7  # 7/min
+
 #: Refused *lookups* tolerated in a run before we stop asking. Counted once per
 #: lookup, not once per attempt, so the number means what it says: the
 #: ``_MAX_ATTEMPTS`` retries inside one lookup are a single refusal. (Counting
@@ -162,18 +173,28 @@ def rate_limited_out():
         return _rate_limited_lookups >= _CIRCUIT_TRIP_AFTER
 
 
-def _pace():
+def _pace(min_interval=None):
     """Block until the shared clock allows another call.
 
-    Waits for whichever is later: ``_MIN_INTERVAL_SECONDS`` since the last call,
-    or the end of a backoff that a 429 imposed on every thread. Sleeping while
-    holding the lock is deliberate — it is exactly what makes the interval
-    process-wide instead of per-thread.
+    Waits for whichever is later: ``min_interval`` (default
+    ``_MIN_INTERVAL_SECONDS``) since the last call, or the end of a backoff
+    that a 429 imposed on every thread. Sleeping while holding the lock is
+    deliberate — it is exactly what makes the interval process-wide instead
+    of per-thread.
+
+    A caller asking for a wider interval (``submit()``, per archive.org's
+    documented per-minute capture limits) still moves the *one* shared clock
+    forward by that wider amount, so a subsequent call from anywhere else
+    — even one that would have been happy with the narrower default — waits
+    out the same gap. Never the other way around: a call cannot shrink an
+    interval another call already committed the clock to.
     """
     global _last_call_at
+    if min_interval is None:
+        min_interval = _MIN_INTERVAL_SECONDS
     with _pace_lock:
         now = time.monotonic()
-        target = max(_last_call_at + _MIN_INTERVAL_SECONDS, _blocked_until)
+        target = max(_last_call_at + min_interval, _blocked_until)
         if target > now:
             time.sleep(target - now)
         _last_call_at = time.monotonic()
@@ -255,6 +276,43 @@ def _paced_get(endpoint, timeout, params=None, headers=None):
 def _get_availability(url, timeout):
     """GET the availability API through the shared pacing/backoff/breaker path."""
     return _paced_get(_AVAILABILITY_API, timeout, params={"url": url})
+
+
+def _paced_submit(method, endpoint, timeout, min_interval, **kwargs):
+    """POST/GET a capture request with pacing, the shared circuit breaker, and
+    retry — but only for a *confirmed* refusal, not an ambiguous one.
+
+    ``submit()`` used to skip pacing and the breaker entirely: it fired
+    straight at the capture endpoint with no clock and no backoff, and a 429
+    here never fed back into the same breaker every other call respects. A
+    caller submitting many URLs (doc-crawler's batch loop, for one) could
+    exceed archive.org's documented capture-per-minute limit with nothing to
+    stop it, and the breaker meant to catch exactly this never saw it happen.
+
+    Deliberately narrower than ``_paced_get``: a plain request exception
+    (``Timeout``/``ConnectionError``) is NOT retried here and propagates
+    immediately, because that failure mode is ambiguous — the request may
+    have reached archive.org and started a capture before the connection
+    dropped, and retrying would risk a second, duplicate capture for a
+    request that may have already succeeded. That is exactly the case
+    ``submit()``'s own ``outcome_unknown`` field exists to describe rather
+    than paper over. A 429 is different: archive.org's own response
+    confirms nothing was created, so backing off and trying again is safe.
+    """
+    last_exc = None
+    for attempt in range(_MAX_ATTEMPTS):
+        _pace(min_interval)
+        resp = getattr(requests, method)(endpoint, timeout=timeout, **kwargs)
+        if resp.status_code == 429:
+            last_exc = requests.HTTPError(
+                f"429 Client Error: Too Many Requests for url: {resp.url}",
+                response=resp,
+            )
+            _note_rate_limited(_retry_after_seconds(resp, attempt))
+            continue
+        return resp
+    _note_lookup_refused()
+    raise last_exc
 
 
 def _transport_failure_summary(exc, what):
@@ -444,14 +502,29 @@ def check(url, timeout=10, stale_days=None):
 #:   ``capture_outlinks`` — every outlink of every submitted URL is an enormous
 #:     load increase on a service that already throttles callers, for pages
 #:     nothing asked to capture.
-#:   ``capture_screenshot`` — a second form of evidence, and a real option worth
-#:     revisiting, but this package renders nothing from it today.
 #:   ``force_get`` — trades the headless browser for a plain GET, which captures
 #:     JavaScript-rendered pages worse. The point is a faithful copy.
+#:
+#: ``capture_screenshot``, ``outlinks_availability``, ``skip_first_archive``,
+#: ``js_behavior_timeout``, ``target_username``/``target_password`` are real
+#: documented options this client does not enable by default (none of this
+#: package's own consumers needed them at extraction time), but are exposed
+#: as optional ``submit()`` keyword arguments below rather than hardcoded off
+#: — a caller that does need a screenshot, or to capture a page behind a
+#: login form, should not have to reimplement request-building to get it.
 _CAPTURE_OPTIONS = {"capture_all": "0"}
 
 
-def _capture_params(url, stale_days=None):
+def _capture_params(
+    url,
+    stale_days=None,
+    capture_screenshot=False,
+    outlinks_availability=False,
+    skip_first_archive=False,
+    js_behavior_timeout=None,
+    target_username=None,
+    target_password=None,
+):
     """Form fields for one authenticated capture request.
 
     ``if_not_archived_within`` is deliberately NOT sent, and it is worth saying
@@ -478,10 +551,35 @@ def _capture_params(url, stale_days=None):
 
     ``stale_days`` is accepted so callers need not care which options apply.
     """
-    return {"url": url, **_CAPTURE_OPTIONS}
+    params = {"url": url, **_CAPTURE_OPTIONS}
+    if capture_screenshot:
+        params["capture_screenshot"] = "1"
+    if outlinks_availability:
+        params["outlinks_availability"] = "1"
+    if skip_first_archive:
+        params["skip_first_archive"] = "1"
+    if js_behavior_timeout is not None:
+        params["js_behavior_timeout"] = str(js_behavior_timeout)
+    if target_username is not None:
+        params["target_username"] = target_username
+    if target_password is not None:
+        params["target_password"] = target_password
+    return params
 
 
-def submit(url, timeout=30, access_key=None, secret_key=None, stale_days=None):
+def submit(
+    url,
+    timeout=30,
+    access_key=None,
+    secret_key=None,
+    stale_days=None,
+    capture_screenshot=False,
+    outlinks_availability=False,
+    skip_first_archive=False,
+    js_behavior_timeout=None,
+    target_username=None,
+    target_password=None,
+):
     """Request that archive.org capture and archive ``url`` (Save Page Now / SPN2).
 
     Returns what was *established*, not merely what was asked for. The two
@@ -522,6 +620,19 @@ def submit(url, timeout=30, access_key=None, secret_key=None, stale_days=None):
                                      capture anyway, so this must not be
                                      reported as a failed submission.
       error             str        — set only on failure
+
+    Optional capture options (authenticated path only — the anonymous
+    endpoint takes no form fields, so these are silently unused without
+    credentials): ``capture_screenshot`` (also captures a full-page PNG;
+    surfaced back via ``check_job_status``'s ``screenshot_url``),
+    ``outlinks_availability`` (archive.org includes prior-capture timestamps
+    for the page's outlinks in the job-status response), ``skip_first_archive``
+    (skip the "is this the first capture of this URL" check, per archive.org's
+    docs — faster when a caller already knows the answer), ``js_behavior_timeout``
+    (seconds of JS execution before the headless browser gives up, 0-30,
+    archive.org's own default is 5), ``target_username``/``target_password``
+    (login credentials for a page behind a form — ``target_password`` is
+    redacted the same way ``secret_key`` is if it ever surfaces in an error).
     """
     # The breaker exists because archive.org throttles per IP across endpoints.
     # A naive submission path ignores it: once five lookups had been refused,
@@ -545,15 +656,32 @@ def submit(url, timeout=30, access_key=None, secret_key=None, stale_days=None):
         }
 
     headers = dict(DEFAULT_HEADERS)
+    authenticated = bool(access_key and secret_key)
+    min_interval = (
+        _AUTHENTICATED_SUBMIT_INTERVAL_SECONDS
+        if authenticated
+        else _ANONYMOUS_SUBMIT_INTERVAL_SECONDS
+    )
     try:
-        if access_key and secret_key:
+        if authenticated:
             headers["Authorization"] = f"LOW {access_key}:{secret_key}"
             headers["Accept"] = "application/json"
-            resp = requests.post(
+            resp = _paced_submit(
+                "post",
                 _SAVE_API,
-                data=_capture_params(url, stale_days),
+                timeout,
+                min_interval,
+                data=_capture_params(
+                    url,
+                    stale_days,
+                    capture_screenshot=capture_screenshot,
+                    outlinks_availability=outlinks_availability,
+                    skip_first_archive=skip_first_archive,
+                    js_behavior_timeout=js_behavior_timeout,
+                    target_username=target_username,
+                    target_password=target_password,
+                ),
                 headers=headers,
-                timeout=timeout,
             )
             resp.raise_for_status()
             payload = resp.json()
@@ -577,10 +705,8 @@ def submit(url, timeout=30, access_key=None, secret_key=None, stale_days=None):
                 )
             return result
 
-        resp = requests.get(
-            f"{_SAVE_API}/{url}",
-            headers=headers,
-            timeout=timeout,
+        resp = _paced_submit(
+            "get", f"{_SAVE_API}/{url}", timeout, min_interval, headers=headers
         )
         resp.raise_for_status()
         result = {"url": url, "submitted": True, "job_id": None, "archived": False}
@@ -591,14 +717,23 @@ def submit(url, timeout=30, access_key=None, secret_key=None, stale_days=None):
             result.update(_snapshot_state(resp.url, m.group(1), stale_days))
         return result
     except Exception as exc:
-        err = redact.redact_value(redact.redact_url_keys(str(exc)), secret_key)
+        err = redact.redact_value(
+            redact.redact_value(redact.redact_url_keys(str(exc)), secret_key),
+            target_password,
+        )
         # A read timeout is not a refusal. The request reached archive.org and
         # we gave up waiting for the answer; the capture may have run to
         # completion regardless. Observed live 2026-09-05 — a 30s read timeout
         # on a save that archive.org had almost certainly accepted. Calling
         # that "submission failed" overstates it in the other direction, the
         # same way calling it "archived" would.
+        #
+        # A confirmed 429 (raised by _paced_submit only after exhausting its
+        # own retries) is different from an ambiguous timeout — archive.org's
+        # response establishes nothing was captured, so this is a real
+        # refusal, not an unknown outcome.
         timed_out = isinstance(exc, requests.exceptions.Timeout)
+        rate_limited = getattr(getattr(exc, "response", None), "status_code", None) == 429
         log.warning(
             "Wayback submission %s for %s: %s",
             "timed out" if timed_out else "failed",
@@ -616,6 +751,8 @@ def submit(url, timeout=30, access_key=None, secret_key=None, stale_days=None):
         }
         if timed_out:
             result["outcome_unknown"] = True
+        if rate_limited:
+            result["rate_limited"] = True
         return result
 
 
@@ -652,6 +789,25 @@ def check_job_status(
       snapshot_ts       str
       snapshot_age_days int | None
       snapshot_stale    bool
+      screenshot_url    str | None — present on "success" only if the
+                                     submission set ``capture_screenshot``
+      duration_seconds  float | None — present on "success" only
+      resources         list[str] | None — every resource URL captured
+                                     alongside the page (present on "success"
+                                     only)
+      outlinks          dict | None — ``{url: job_id}`` for outlinks queued
+                                     by ``outlinks_availability`` (present on
+                                     "success" only, and only if requested)
+      error_code        str | None — the raw SPN2 ``status_ext`` code
+                                     (present on "failed" only, when
+                                     archive.org supplied one)
+      retry_category    str | None — "permanent" / "transient" /
+                                     "quota_exhausted" for ``error_code``, via
+                                     ``categorize_job_error`` (present on
+                                     "failed" only; ``None`` if the code is
+                                     absent or not recognized — see that
+                                     function's docstring for why that is not
+                                     the same as "permanent")
     """
     if not job_id:
         return {
@@ -741,6 +897,18 @@ def check_job_status(
                 f"https://web.archive.org/web/{ts}/{original}", ts, stale_days
             )
         )
+        # Documented success fields beyond the snapshot itself — each only
+        # present when the submission asked for it (screenshot, outlinks) or
+        # when archive.org happens to include it (duration, resources).
+        result["screenshot_url"] = data.get("screenshot") or None
+        duration = data.get("duration_sec")
+        result["duration_seconds"] = (
+            duration if isinstance(duration, (int, float)) else None
+        )
+        resources = data.get("resources")
+        result["resources"] = resources if isinstance(resources, list) else None
+        outlinks = data.get("outlinks")
+        result["outlinks"] = outlinks if isinstance(outlinks, dict) else None
         return result
     if status == "pending":
         return {
@@ -751,14 +919,15 @@ def check_job_status(
     if status == "error":
         # SPN2 spreads the explanation over three optional fields; take the most
         # human one present rather than whichever happens to be first.
-        detail = (
-            data.get("message") or data.get("status_ext") or data.get("exception") or ""
-        )
+        status_ext = data.get("status_ext")
+        detail = data.get("message") or status_ext or data.get("exception") or ""
         return {
             "job_id": job_id,
             "state": "failed",
             "reason": str(detail).strip()
             or "archive.org reported an unspecified error",
+            "error_code": status_ext or None,
+            "retry_category": categorize_job_error(status_ext),
         }
     return {
         "job_id": job_id,
@@ -931,6 +1100,76 @@ def system_status(timeout=15, access_key=None, secret_key=None):
         "known": True,
         "reason": None,
     }
+
+
+#: How to react to each SPN2 ``status_ext`` code, per archive.org's own SPN2
+#: API docs (fetched 2026-09-13) — the only place these ~30 codes are
+#: enumerated at all; nothing about them is discoverable from the response
+#: shape itself. Three buckets, because a caller deciding whether to retry a
+#: failed capture needs one of three different answers, not one:
+#:
+#:   "permanent"       — retrying changes nothing (bad URL, blocked, gone).
+#:                        A batch loop should stop treating this URL as
+#:                        pending and move on, not keep re-queuing it.
+#:   "transient"        — archive.org's own infrastructure had a bad moment;
+#:                        the same URL is worth trying again later.
+#:   "quota_exhausted"  — a real ceiling was hit (daily/bandwidth/session
+#:                        limit). Retrying *this* URL sooner does nothing;
+#:                        the whole run should back off, not just this item.
+#:
+#: Heuristic, not a guarantee — archive.org's docs give a one-line gloss per
+#: code, not a retry contract, and a code absent from this table (or absent
+#: entirely, which happens — see ``check_job_status``) means "unknown", not
+#: "permanent". Treat "unknown" as transient-leaning if a caller must choose.
+_JOB_ERROR_CATEGORIES = {
+    "error:bad-gateway": "transient",
+    "error:bad-request": "permanent",
+    "error:bandwidth-limit-exceeded": "quota_exhausted",
+    "error:blocked": "permanent",
+    "error:blocked-client-ip": "permanent",
+    "error:blocked-url": "permanent",
+    "error:browsing-timeout": "transient",
+    "error:capture-location-error": "transient",
+    "error:cannot-fetch": "transient",
+    "error:celery": "transient",
+    "error:filesize-limit": "permanent",
+    "error:ftp-access-denied": "permanent",
+    "error:gateway-timeout": "transient",
+    "error:http-version-not-supported": "permanent",
+    "error:internal-server-error": "transient",
+    "error:invalid-url-syntax": "permanent",
+    "error:invalid-server-response": "transient",
+    "error:invalid-host-resolution": "permanent",
+    "error:job-failed": "transient",
+    "error:method-not-allowed": "permanent",
+    "error:not-implemented": "permanent",
+    "error:no-browsers-available": "transient",
+    "error:network-authentication-required": "transient",
+    "error:no-access": "permanent",
+    "error:not-found": "permanent",
+    "error:proxy-error": "transient",
+    "error:protocol-error": "transient",
+    "error:read-timeout": "transient",
+    "error:soft-time-limit-exceeded": "transient",
+    "error:service-unavailable": "transient",
+    "error:too-many-daily-captures": "quota_exhausted",
+    "error:too-many-redirects": "permanent",
+    "error:too-many-requests": "quota_exhausted",
+    "error:user-session-limit": "quota_exhausted",
+    "error:unauthorized": "permanent",
+    "error:max-daily-bandwidth": "quota_exhausted",
+    "error:max-daily-bandwidth-from-ip": "quota_exhausted",
+    "error:max-daily-bandwidth-host": "quota_exhausted",
+}
+
+
+def categorize_job_error(status_ext):
+    """"permanent" / "transient" / "quota_exhausted" for a known SPN2
+    ``status_ext`` code, or ``None`` for one this table doesn't recognize
+    (including no code at all). See ``_JOB_ERROR_CATEGORIES`` for what each
+    bucket means and why "unknown" is deliberately not folded into one.
+    """
+    return _JOB_ERROR_CATEGORIES.get(status_ext)
 
 
 def service_health_note(status):

@@ -5,11 +5,33 @@ import threading
 import time
 from unittest.mock import patch, MagicMock
 
+import pytest
 import requests
 
 from spn_client import client as wayback
 
 JOB_ID = "spn2-abc123"
+
+
+@pytest.fixture(autouse=True)
+def neutralise_submit_pacing():
+    """Zero out submit()'s per-tier pacing interval for every test.
+
+    Mirrors the reasoning that already applies to ``_MIN_INTERVAL_SECONDS``
+    on individual tests below: these intervals (20s anonymous, ~8.57s
+    authenticated, per archive.org's documented per-minute capture limits)
+    are real and load-bearing in production, but nothing about the tests in
+    this file is *about* that pacing except ``TestSubmitPacing``'s own tests,
+    which patch the real values back in locally the same way the existing
+    pacing tests already do for ``_MIN_INTERVAL_SECONDS``. Without this, every other test
+    calling ``submit()`` pays the real interval in wall-clock sleep —
+    harmless to correctness, but it turned a 33s suite into a 4-minute one.
+    """
+    with (
+        patch.object(wayback, "_ANONYMOUS_SUBMIT_INTERVAL_SECONDS", 0.0),
+        patch.object(wayback, "_AUTHENTICATED_SUBMIT_INTERVAL_SECONDS", 0.0),
+    ):
+        yield
 
 
 def _mock_response(payload, url="https://example.com"):
@@ -426,8 +448,8 @@ class TestPacingClock:
     """``_pace()`` actually waits on the shared clock.
 
     Everything else about the guard is asserted in ``TestRateLimitGuard``, but
-    every test there — and the ``neutralise_wayback_pacing`` fixture in
-    ``conftest.py`` — sets the intervals to 0.0, so nothing checks that a
+    every test there — and the ``neutralise_submit_pacing`` autouse fixture at
+    the top of this file — sets the intervals to 0.0, so nothing checks that a
     non-zero interval is honoured. Before this class, the only thing standing
     behind ``_MIN_INTERVAL_SECONDS`` was six unrelated tests in
     ``TestWaybackCheck`` incidentally sitting out the wait and asserting nothing
@@ -490,6 +512,84 @@ class TestPacingClock:
         assert 29.0 <= slept[0] <= 30.0, (
             f"Waited {slept} — the 3s interval won over the 30s backoff"
         )
+
+
+class TestSubmitPacing:
+    """``submit()`` used to skip the shared clock entirely — it only checked
+    the breaker, never called ``_pace()``, and its own 429s never fed back
+    into the breaker every other call respects. This class is the coverage
+    that gap didn't have before it was closed.
+    """
+
+    def setup_method(self):
+        wayback.reset_rate_limit_state()
+
+    def teardown_method(self):
+        wayback.reset_rate_limit_state()
+
+    def test_submit_paces_apart(self):
+        """Overrides this file's autouse zeroing to check a real interval is
+        honoured — same pattern as ``TestPacingClock``."""
+        slept = []
+        with (
+            patch.object(wayback, "_ANONYMOUS_SUBMIT_INTERVAL_SECONDS", 20.0),
+            patch.object(wayback.time, "sleep", side_effect=slept.append),
+            patch(
+                "spn_client.client.requests.get",
+                return_value=_mock_response({}),
+            ),
+        ):
+            wayback.submit("https://example.com/1")
+            wayback.submit("https://example.com/2")
+        assert len(slept) == 1, f"second submit() did not pace at all: {slept}"
+        assert 19.9 <= slept[0] <= 20.0, slept
+
+    def test_authenticated_submit_uses_the_stricter_documented_interval(self):
+        """7/min authenticated (~8.57s) vs 3/min anonymous (20s) — a caller
+        with credentials must not be paced as if it had none, or vice versa."""
+        slept = []
+        with (
+            patch.object(wayback, "_AUTHENTICATED_SUBMIT_INTERVAL_SECONDS", 60.0 / 7),
+            patch.object(wayback.time, "sleep", side_effect=slept.append),
+            patch(
+                "spn_client.client.requests.post",
+                return_value=_mock_response({"job_id": "x"}),
+            ),
+        ):
+            wayback.submit("https://example.com/1", access_key="AK", secret_key="SK")
+            wayback.submit("https://example.com/2", access_key="AK", secret_key="SK")
+        assert len(slept) == 1
+        assert 8.4 <= slept[0] <= 8.6, slept
+
+    def test_a_429_from_the_capture_endpoint_is_retried_then_reported(self):
+        """A confirmed 429 is safe to retry (archive.org's own response says
+        nothing was created) — unlike a bare Timeout/ConnectionError, which
+        stays a single, unretried attempt (see ``TestSubmitEstablishesWhatItCan``)
+        because the request might have already started a capture."""
+        resp_429 = _error_response(429)
+        resp_429.raise_for_status.side_effect = None  # 429 short-circuits before this
+        with (
+            patch.object(wayback.time, "sleep"),
+            patch(
+                "spn_client.client.requests.get", return_value=resp_429
+            ) as mock_get,
+        ):
+            result = wayback.submit("https://example.com/")
+        assert mock_get.call_count == wayback._MAX_ATTEMPTS
+        assert result["submitted"] is False
+        assert result["rate_limited"] is True
+
+    def test_repeated_429s_trip_the_shared_breaker(self):
+        """The breaker submit() now feeds is the same one check() reads —
+        enough refused submissions must stop a later check() too."""
+        resp_429 = _error_response(429)
+        with (
+            patch.object(wayback.time, "sleep"),
+            patch("spn_client.client.requests.get", return_value=resp_429),
+        ):
+            for _ in range(wayback._CIRCUIT_TRIP_AFTER):
+                wayback.submit(f"https://example.com/{_}")
+        assert wayback.rate_limited_out() is True
 
 
 def _json_response(payload, status_code=200, content=b"{}"):
@@ -696,6 +796,59 @@ class TestCheckJobStatus:
         assert result["state"] == "unknown"
         assert "something-new" in result["reason"]
 
+    def test_error_surfaces_the_raw_code_and_its_retry_category(self):
+        result, _ = self._call(
+            _json_response(
+                {"status": "error", "status_ext": "error:too-many-daily-captures"}
+            )
+        )
+        assert result["error_code"] == "error:too-many-daily-captures"
+        assert result["retry_category"] == "quota_exhausted"
+
+    def test_error_with_no_status_ext_has_no_code_or_category(self):
+        result, _ = self._call(
+            _json_response({"status": "error", "message": "something went wrong"})
+        )
+        assert result["error_code"] is None
+        assert result["retry_category"] is None
+
+    def test_success_surfaces_screenshot_duration_resources_and_outlinks(self):
+        result, _ = self._call(
+            _json_response(
+                {
+                    "status": "success",
+                    "timestamp": "20260905121627",
+                    "original_url": "https://example.com/",
+                    "screenshot": "https://web.archive.org/web/.../screenshot.png",
+                    "duration_sec": 4.2,
+                    "resources": ["https://example.com/style.css"],
+                    "outlinks": {"https://example.com/other": "spn2-def456"},
+                }
+            )
+        )
+        assert result["screenshot_url"] == "https://web.archive.org/web/.../screenshot.png"
+        assert result["duration_seconds"] == 4.2
+        assert result["resources"] == ["https://example.com/style.css"]
+        assert result["outlinks"] == {"https://example.com/other": "spn2-def456"}
+
+    def test_success_fields_are_none_when_not_returned(self):
+        """A caller that didn't ask for a screenshot/outlinks must not see a
+        stale value from some other job — these are always present, never
+        just missing, so a caller can rely on the key existing."""
+        result, _ = self._call(
+            _json_response(
+                {
+                    "status": "success",
+                    "timestamp": "20260905121627",
+                    "original_url": "https://example.com/",
+                }
+            )
+        )
+        assert result["screenshot_url"] is None
+        assert result["duration_seconds"] is None
+        assert result["resources"] is None
+        assert result["outlinks"] is None
+
     def test_a_non_json_answer_says_what_arrived(self):
         """Same misdirection guard as the availability API: reporting the JSON
         decoder's complaint sends the reader hunting for a parser bug."""
@@ -853,6 +1006,38 @@ class TestCaptureOptions:
 
     def test_the_url_is_still_sent(self):
         assert self._post()["url"] == "https://example.com/"
+
+    def test_capture_screenshot_is_opt_in(self):
+        assert self._post(capture_screenshot=True)["capture_screenshot"] == "1"
+
+    def test_outlinks_availability_is_opt_in(self):
+        assert self._post(outlinks_availability=True)["outlinks_availability"] == "1"
+
+    def test_skip_first_archive_is_opt_in(self):
+        assert self._post(skip_first_archive=True)["skip_first_archive"] == "1"
+
+    def test_js_behavior_timeout_is_forwarded(self):
+        assert self._post(js_behavior_timeout=15)["js_behavior_timeout"] == "15"
+
+    def test_target_username_and_password_are_forwarded(self):
+        data = self._post(target_username="alice", target_password="hunter2")
+        assert data["target_username"] == "alice"
+        assert data["target_password"] == "hunter2"
+
+    def test_target_password_is_redacted_out_of_an_error(self):
+        """The same treatment ``secret_key`` already gets — a page-login
+        credential is just as much a secret as the S3 key pair."""
+        with patch(
+            "spn_client.client.requests.post",
+            side_effect=Exception("login failed with password hunter2"),
+        ):
+            result = wayback.submit(
+                "https://example.com/",
+                access_key="AK",
+                secret_key="SK",
+                target_password="hunter2",
+            )
+        assert "hunter2" not in result["error"]
 
 
 class TestSubmitHonoursTheBreaker:
@@ -1167,3 +1352,43 @@ class TestServiceHealthNote:
         looking at is noise, not information."""
         assert wayback.service_health_note({"known": False}) is None
         assert wayback.service_health_note(None) is None
+
+
+class TestJobErrorCategorization:
+    """``categorize_job_error`` — the retry-worthiness of each documented
+    SPN2 ``status_ext`` code. Not exhaustive over all ~30 codes; one
+    representative per bucket, plus the unknown-code case that matters most:
+    a caller must not treat "we don't recognize this code" as "permanent"."""
+
+    def test_a_permanent_failure_is_categorized(self):
+        assert wayback.categorize_job_error("error:invalid-url-syntax") == "permanent"
+        assert wayback.categorize_job_error("error:no-access") == "permanent"
+        assert wayback.categorize_job_error("error:not-found") == "permanent"
+
+    def test_a_transient_failure_is_categorized(self):
+        assert wayback.categorize_job_error("error:bad-gateway") == "transient"
+        assert wayback.categorize_job_error("error:gateway-timeout") == "transient"
+        assert wayback.categorize_job_error("error:cannot-fetch") == "transient"
+
+    def test_a_quota_exhausted_failure_is_categorized(self):
+        assert (
+            wayback.categorize_job_error("error:too-many-daily-captures")
+            == "quota_exhausted"
+        )
+        assert (
+            wayback.categorize_job_error("error:too-many-requests")
+            == "quota_exhausted"
+        )
+        assert (
+            wayback.categorize_job_error("error:max-daily-bandwidth")
+            == "quota_exhausted"
+        )
+
+    def test_an_unrecognized_code_is_none_not_a_guess(self):
+        """A code archive.org adds tomorrow, or a typo, must not silently
+        collapse into "permanent" — a caller that stops retrying on ``None``
+        would give up on something that might just be new."""
+        assert wayback.categorize_job_error("error:something-new-2027") is None
+
+    def test_no_code_at_all_is_none(self):
+        assert wayback.categorize_job_error(None) is None
