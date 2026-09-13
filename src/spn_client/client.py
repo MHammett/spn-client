@@ -506,12 +506,21 @@ def check(url, timeout=10, stale_days=None):
 #:     JavaScript-rendered pages worse. The point is a faithful copy.
 #:
 #: ``capture_screenshot``, ``outlinks_availability``, ``skip_first_archive``,
-#: ``js_behavior_timeout``, ``target_username``/``target_password`` are real
+#: ``js_behavior_timeout``, ``target_username``/``target_password``,
+#: ``capture_cookie``, ``use_user_agent``, ``delay_wb_availability`` are real
 #: documented options this client does not enable by default (none of this
 #: package's own consumers needed them at extraction time), but are exposed
 #: as optional ``submit()`` keyword arguments below rather than hardcoded off
 #: — a caller that does need a screenshot, or to capture a page behind a
 #: login form, should not have to reimplement request-building to get it.
+#:
+#: Cookie-based session authentication (the ``logged-in-sig``/
+#: ``logged-in-user`` alternative to an S3 key pair, per archive.org's own
+#: docs) is deliberately NOT implemented — this client authenticates
+#: outbound requests to archive.org's API with S3 keys only, which the docs
+#: themselves call "highly preferable." ``capture_cookie`` below is a
+#: different, unrelated thing: a cookie *sent to the page being captured*,
+#: for archiving something that's itself behind a login.
 _CAPTURE_OPTIONS = {"capture_all": "0"}
 
 
@@ -524,6 +533,9 @@ def _capture_params(
     js_behavior_timeout=None,
     target_username=None,
     target_password=None,
+    capture_cookie=None,
+    use_user_agent=None,
+    delay_wb_availability=False,
 ):
     """Form fields for one authenticated capture request.
 
@@ -564,12 +576,18 @@ def _capture_params(
         params["target_username"] = target_username
     if target_password is not None:
         params["target_password"] = target_password
+    if capture_cookie is not None:
+        params["capture_cookie"] = capture_cookie
+    if use_user_agent is not None:
+        params["use_user_agent"] = use_user_agent
+    if delay_wb_availability:
+        params["delay_wb_availability"] = "1"
     return params
 
 
 def submit(
     url,
-    timeout=30,
+    timeout=120,
     access_key=None,
     secret_key=None,
     stale_days=None,
@@ -579,6 +597,9 @@ def submit(
     js_behavior_timeout=None,
     target_username=None,
     target_password=None,
+    capture_cookie=None,
+    use_user_agent=None,
+    delay_wb_availability=False,
 ):
     """Request that archive.org capture and archive ``url`` (Save Page Now / SPN2).
 
@@ -593,6 +614,14 @@ def submit(
     wait for. A naive implementation that follows the redirect and discards
     the final URL, reporting only ``submitted: True``, throws away an answer
     archive.org has already given.
+
+    ``timeout`` defaults to 120s, not the more typical 10-30s, because this
+    path's request *is* the capture: archive.org's own SPN2 docs list "max
+    total capture duration: 2 minutes," and a shorter client timeout can cut
+    off a slow-but-legitimate capture before archive.org itself was done —
+    reported here as ``outcome_unknown`` (a timeout, not a refusal) but an
+    avoidable one. The authenticated path only queues the job and returns
+    immediately, so the longer default costs it nothing.
 
     **Authenticated** (``POST /save`` with an S3-style key pair from
     https://archive.org/account/s3.php): the capture is queued and the response
@@ -632,7 +661,15 @@ def submit(
     (seconds of JS execution before the headless browser gives up, 0-30,
     archive.org's own default is 5), ``target_username``/``target_password``
     (login credentials for a page behind a form — ``target_password`` is
-    redacted the same way ``secret_key`` is if it ever surfaces in an error).
+    redacted the same way ``secret_key`` is if it ever surfaces in an error),
+    ``capture_cookie`` (a Cookie header sent to the *target page* — a
+    different thing from this client's own S3-key auth to archive.org, for
+    archiving a page that's itself behind a session cookie; also redacted),
+    ``use_user_agent`` (override what User-Agent the capture bot presents to
+    the target site), ``delay_wb_availability`` (the capture becomes visible
+    in the Wayback Machine ~12h later instead of immediately — a real
+    trade-off some callers want, e.g. to avoid a race with their own
+    not-yet-published content).
     """
     # The breaker exists because archive.org throttles per IP across endpoints.
     # A naive submission path ignores it: once five lookups had been refused,
@@ -680,6 +717,9 @@ def submit(
                     js_behavior_timeout=js_behavior_timeout,
                     target_username=target_username,
                     target_password=target_password,
+                    capture_cookie=capture_cookie,
+                    use_user_agent=use_user_agent,
+                    delay_wb_availability=delay_wb_availability,
                 ),
                 headers=headers,
             )
@@ -718,8 +758,11 @@ def submit(
         return result
     except Exception as exc:
         err = redact.redact_value(
-            redact.redact_value(redact.redact_url_keys(str(exc)), secret_key),
-            target_password,
+            redact.redact_value(
+                redact.redact_value(redact.redact_url_keys(str(exc)), secret_key),
+                target_password,
+            ),
+            capture_cookie,
         )
         # A read timeout is not a refusal. The request reached archive.org and
         # we gave up waiting for the answer; the capture may have run to
@@ -793,8 +836,13 @@ def check_job_status(
                                      submission set ``capture_screenshot``
       duration_seconds  float | None — present on "success" only
       resources         list[str] | None — every resource URL captured
-                                     alongside the page (present on "success"
-                                     only)
+                                     alongside the page. Present on "success"
+                                     always (possibly empty); present on
+                                     "pending" and "failed" too, per SPN2's
+                                     docs, but there it is ``None`` whenever
+                                     archive.org's answer didn't include one
+                                     — a job that hasn't fetched anything yet
+                                     genuinely may not have one to report.
       outlinks          dict | None — ``{url: job_id}`` for outlinks queued
                                      by ``outlinks_availability`` (present on
                                      "success" only, and only if requested)
@@ -911,16 +959,22 @@ def check_job_status(
         result["outlinks"] = outlinks if isinstance(outlinks, dict) else None
         return result
     if status == "pending":
+        resources = data.get("resources")
         return {
             "job_id": job_id,
             "state": "pending",
             "reason": "archive.org has not finished this capture yet",
+            # Partial progress: resources captured so far, per SPN2's docs.
+            # Not present on every pending answer — archive.org may simply
+            # not have started fetching anything yet.
+            "resources": resources if isinstance(resources, list) else None,
         }
     if status == "error":
         # SPN2 spreads the explanation over three optional fields; take the most
         # human one present rather than whichever happens to be first.
         status_ext = data.get("status_ext")
         detail = data.get("message") or status_ext or data.get("exception") or ""
+        resources = data.get("resources")
         return {
             "job_id": job_id,
             "state": "failed",
@@ -928,6 +982,9 @@ def check_job_status(
             or "archive.org reported an unspecified error",
             "error_code": status_ext or None,
             "retry_category": categorize_job_error(status_ext),
+            # Documented on error responses too, usually empty in practice —
+            # whatever was captured before the failure, if anything.
+            "resources": resources if isinstance(resources, list) else None,
         }
     return {
         "job_id": job_id,

@@ -1,6 +1,6 @@
 [project]
 name = "spn-client"
-version = "0.2.1"
+version = "0.3.0"
 description = "A hardened client for archive.org's availability and Save Page Now (SPN2) APIs — process-wide rate pacing with a circuit breaker, dual-mode anonymous/S3-authenticated submission, and an explicit archive-outcome vocabulary."
 readme = "README.md"
 license = "MIT"

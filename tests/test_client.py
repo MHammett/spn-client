@@ -768,6 +768,33 @@ class TestCheckJobStatus:
     def test_pending_is_pending(self):
         result, _ = self._call(_json_response({"status": "pending"}))
         assert result["state"] == "pending"
+        assert result["resources"] is None
+
+    def test_pending_surfaces_partial_resources_when_present(self):
+        result, _ = self._call(
+            _json_response(
+                {"status": "pending", "resources": ["https://example.com/style.css"]}
+            )
+        )
+        assert result["resources"] == ["https://example.com/style.css"]
+
+    def test_failed_surfaces_resources_when_present(self):
+        result, _ = self._call(
+            _json_response(
+                {
+                    "status": "error",
+                    "status_ext": "error:filesize-limit",
+                    "resources": [],
+                }
+            )
+        )
+        assert result["resources"] == []
+
+    def test_failed_resources_is_none_when_absent(self):
+        result, _ = self._call(
+            _json_response({"status": "error", "status_ext": "error:no-access"})
+        )
+        assert result["resources"] is None
 
     def test_an_error_reports_archive_orgs_own_reason(self):
         result, _ = self._call(
@@ -1007,6 +1034,17 @@ class TestCaptureOptions:
     def test_the_url_is_still_sent(self):
         assert self._post()["url"] == "https://example.com/"
 
+    def test_default_timeout_covers_archive_orgs_documented_capture_ceiling(self):
+        """archive.org's own SPN2 docs list a 2-minute max capture duration on
+        the synchronous anonymous path; a shorter client default risks cutting
+        off a slow-but-legitimate capture."""
+        with patch(
+            "spn_client.client.requests.post",
+            return_value=_mock_response({"job_id": "spn2-x"}),
+        ) as mock_post:
+            wayback.submit("https://example.com/", access_key="AK", secret_key="SK")
+        assert mock_post.call_args.kwargs["timeout"] == 120
+
     def test_capture_screenshot_is_opt_in(self):
         assert self._post(capture_screenshot=True)["capture_screenshot"] == "1"
 
@@ -1038,6 +1076,32 @@ class TestCaptureOptions:
                 target_password="hunter2",
             )
         assert "hunter2" not in result["error"]
+
+    def test_capture_cookie_and_user_agent_are_forwarded(self):
+        data = self._post(
+            capture_cookie="session=abc123", use_user_agent="MyBot/1.0"
+        )
+        assert data["capture_cookie"] == "session=abc123"
+        assert data["use_user_agent"] == "MyBot/1.0"
+
+    def test_delay_wb_availability_is_opt_in(self):
+        assert "delay_wb_availability" not in self._post()
+        assert self._post(delay_wb_availability=True)["delay_wb_availability"] == "1"
+
+    def test_capture_cookie_is_redacted_out_of_an_error(self):
+        """A session cookie for the *target page* is just as much a secret as
+        the S3 key pair or a target_password — it can carry a login session."""
+        with patch(
+            "spn_client.client.requests.post",
+            side_effect=Exception("capture failed, cookie session=abc123 rejected"),
+        ):
+            result = wayback.submit(
+                "https://example.com/",
+                access_key="AK",
+                secret_key="SK",
+                capture_cookie="session=abc123",
+            )
+        assert "abc123" not in result["error"]
 
 
 class TestSubmitHonoursTheBreaker:
