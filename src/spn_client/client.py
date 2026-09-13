@@ -7,6 +7,14 @@ submission with async job-status polling, and an outcome vocabulary that
 distinguishes "we asked archive.org" from "archive.org confirmed it archived
 this." Every non-obvious behavior below is a direct response to a dated,
 measured incident, not a speculative design.
+
+References (see also this package's README, which links the same sources
+plus the upstream issues this project has filed/commented on):
+  - Wayback Availability API: https://archive.org/help/wayback_api.php
+  - SPN2 Public API docs (Google Doc, not linked from the page above):
+    https://docs.google.com/document/d/1Nsv52MvSjbLb2PCpHlat0gkzw0EvtSgpKHu4mk0MnrA
+  - Internet Archive's own official Go SPN client, cross-checked against the
+    design here: https://github.com/internetarchive/gospn
 """
 
 import logging

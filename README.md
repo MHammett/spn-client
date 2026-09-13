@@ -44,6 +44,10 @@ a guess.
 pip install spn-client
 ```
 
+Using an AI coding assistant? This repo is also servable as an MCP doc
+source at `https://gitmcp.io/MHammett/spn-client` (no setup on this end
+required — see [`llms.txt`](llms.txt) for the structured summary it reads).
+
 ## Usage
 
 ```python
@@ -113,6 +117,39 @@ This is the archive.org client only — it has no opinion about:
   ledger/cache concern)
 - Batch-loop concerns like a progress heartbeat or a wall-clock budget across
   many submissions — those depend on your own operational needs
+- Bulk/historical queries (all snapshots of a URL, date-range filtering,
+  status-code filtering) — that's what archive.org's separate
+  [CDX Server API](https://github.com/internetarchive/wayback/tree/master/wayback-cdx-server)
+  is for. This library only ever asks for the single closest snapshot.
+
+## References
+
+The two APIs this client wraps, and where its non-obvious behavior comes from:
+
+- [Wayback Machine Availability API](https://archive.org/help/wayback_api.php)
+  — the official docs for `check()`. Silent on rate limits; ours were
+  measured (see `client.py`'s comments above `_MIN_INTERVAL_SECONDS`).
+- [SPN2 Public API docs](https://docs.google.com/document/d/1Nsv52MvSjbLb2PCpHlat0gkzw0EvtSgpKHu4mk0MnrA)
+  (Google Doc, not versioned or linked from archive.org's own help page) —
+  the source for every `submit()`/`check_job_status()` parameter, response
+  field, and the ~30 `status_ext` error codes `categorize_job_error()`
+  buckets. Confirmed incomplete in practice — see the issue below.
+- [internetarchive/gospn](https://github.com/internetarchive/gospn) — Internet
+  Archive's own official Go SPN client. Cross-checked against this library's
+  design (see `submit()`'s docstring for where we agree and where we
+  deliberately diverge, e.g. on the default timeout).
+
+Issues this project has filed or commented on upstream, with what it found:
+
+- [internetarchive/wayback#274](https://github.com/internetarchive/wayback/issues/274)
+  — measured rate-limit data (episodic 429s on the availability API,
+  independent of the SPN2 capture-endpoint limits).
+- [internetarchive/wayback#297](https://github.com/internetarchive/wayback/issues/297)
+  — a corroborating incident for a bug already reported there, plus the
+  `outcome_unknown` pattern as a partial client-side workaround.
+- [internetarchive/wayback#304](https://github.com/internetarchive/wayback/issues/304)
+  — `error:no-captures` is a real SPN2 status code absent from the SPN2 docs
+  above; found live, added to `categorize_job_error()` in 0.2.1.
 
 ## License
 

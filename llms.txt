@@ -1,0 +1,29 @@
+# spn-client
+
+> A hardened Python client for archive.org's availability API and Save Page Now
+> (SPN2) API. Process-wide rate pacing with a circuit breaker, dual-mode
+> anonymous/S3-authenticated capture submission, and an explicit
+> archive-outcome vocabulary that distinguishes "we asked archive.org" from
+> "archive.org confirmed it archived this." `pip install spn-client`.
+
+Two public functions cover the common case: `spn_client.check(url)` to see if
+a URL is already archived, and `spn_client.submit(url, access_key=...,
+secret_key=...)` to request a capture. Both are safe to call from a thread
+pool — pacing and rate-limit backoff are process-wide, not per-call.
+
+## Docs
+
+- [README](https://github.com/MHammett/spn-client/blob/main/README.md): install, quickstart, handling a failed capture, all optional `submit()` capture parameters.
+- [CHANGELOG](https://github.com/MHammett/spn-client/blob/main/CHANGELOG.md): what changed in each released version.
+- [client.py](https://github.com/MHammett/spn-client/blob/main/src/spn_client/client.py): full source — every public function's docstring documents its exact return shape (all are `TypedDict`s) and the archive.org behavior it's a response to.
+
+## Reference sources
+
+- [Wayback Availability API docs](https://archive.org/help/wayback_api.php)
+- [SPN2 Public API docs](https://docs.google.com/document/d/1Nsv52MvSjbLb2PCpHlat0gkzw0EvtSgpKHu4mk0MnrA)
+- [Internet Archive's own official Go SPN client (gospn)](https://github.com/internetarchive/gospn), cross-checked against this library's design choices
+
+## Optional
+
+- [SECURITY.md](https://github.com/MHammett/spn-client/blob/main/SECURITY.md): how to report a vulnerability; what this library does and does not do with the credentials you pass it.
+- [Issues filed/commented upstream](https://github.com/internetarchive/wayback/issues?q=is%3Aissue+spn-client): what this project has found and reported back to archive.org itself.
