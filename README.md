@@ -50,40 +50,82 @@ required — see [`llms.txt`](llms.txt) for the structured summary it reads).
 
 ## Usage
 
+The full lifecycle of one URL is three steps: check, submit, then — for the
+authenticated path — resolve a pending job on a *later* call. All three
+matter; skipping the third is the single most common way to misuse this
+library (see "Where the responsibility line is, and why" below).
+
+### 1. Check whether it's already archived
+
 ```python
 import spn_client
 
-result = spn_client.check("https://example.com/some-page")
-if result["archived"] is False or result.get("snapshot_stale"):
-    submission = spn_client.submit(
-        "https://example.com/some-page",
-        access_key=ACCESS_KEY,   # optional — omit for anonymous, lower-rate submission
-        secret_key=SECRET_KEY,
-    )
-    if submission["job_id"]:
-        # authenticated path: poll for the real outcome
-        status = spn_client.check_job_status(
-            submission["job_id"], access_key=ACCESS_KEY, secret_key=SECRET_KEY
-        )
+result = spn_client.check(url)
+if result["archived"] and not result.get("snapshot_stale"):
+    ...  # already durably archived — nothing to do
 ```
+
+### 2. Submit a capture if it isn't
+
+```python
+submission = spn_client.submit(url, access_key=ACCESS_KEY, secret_key=SECRET_KEY)
+
+if submission["archived"]:
+    # Anonymous path, or an authenticated capture archive.org resolved
+    # synchronously — already confirmed, nothing further to check.
+    your_own_storage.mark_archived(url, submission["snapshot_url"])
+elif submission["job_id"]:
+    # Authenticated path: archive.org queued the job. submitted: True here
+    # means "accepted", not "archived" — the capture is not confirmed yet.
+    # Save the job_id somewhere you control and check back on a later
+    # call; do not treat this as done.
+    your_own_storage.save_pending(url, submission["job_id"])
+else:
+    # submitted: False — archive.org refused, or the request itself
+    # failed/timed out. error_summary is safe to show a user; outcome_unknown
+    # distinguishes an ambiguous timeout (the capture may have gone through
+    # anyway — recheck later) from a real refusal.
+    ...
+```
+
+### 3. Resolve a pending job (on a later call, not immediately after step 2)
+
+A queued job takes real time to process — checking its status right after
+`submit()` will usually still say `"pending"`. Persist the `job_id` from
+step 2 and poll it whenever your own schedule next revisits this URL:
+
+```python
+status = spn_client.check_job_status(job_id, access_key=ACCESS_KEY, secret_key=SECRET_KEY)
+
+if status["state"] == "success":
+    your_own_storage.mark_archived(url, status["snapshot_url"])
+elif status["state"] == "failed":
+    category = status["retry_category"]  # "permanent" / "transient" / "quota_exhausted" / None
+    if category == "permanent":
+        your_own_storage.mark_permanently_unavailable(url, status["error_code"])
+    elif category == "quota_exhausted":
+        ...  # stop submitting new URLs this run, not just this one
+    else:
+        pass  # transient (also covers the unrecognized/None case) — worth another attempt later
+else:
+    # "pending" (still queued), "not_checked" (no creds this call, or the
+    # breaker tripped), or "unknown" (couldn't read the answer) — nothing
+    # new to conclude; leave the job_id in place and ask again later.
+    pass
+```
+
+`your_own_storage` above is deliberately not part of this library — a flat
+file, a database column, an in-memory dict, whatever fits your project.
+What matters is tracking exactly these three states (archived /
+permanently unavailable / pending-with-a-job-id), rather than collapsing
+"submitted" into "archived" — the mistake this three-step shape exists to
+prevent.
 
 Call `spn_client.reset_rate_limit_state()` once at the start of each
 independent run/process if you're running this as a long-lived worker —
 the pacing/breaker state is process-wide and intentionally does not reset
 itself, so a breaker tripped by one run would otherwise silently degrade
 the next.
-
-### Handling a failed capture
-
-```python
-status = spn_client.check_job_status(job_id, access_key=ACCESS_KEY, secret_key=SECRET_KEY)
-if status["state"] == "failed":
-    category = status["retry_category"]  # "permanent" / "transient" / "quota_exhausted" / None
-    if category == "quota_exhausted":
-        ...  # stop submitting new URLs this run, not just this one
-    elif category != "permanent":
-        ...  # worth another attempt later (also covers the unknown/None case)
-```
 
 ### Optional capture options
 
@@ -108,6 +150,41 @@ which archive.org's own docs call "highly preferable" anyway. Don't confuse
 that with `capture_cookie` above, which is unrelated: a cookie sent to
 whatever page you're asking archive.org to capture, not to archive.org.
 
+### Checking capacity before a big batch
+
+Rate pacing and the circuit breaker already protect against archive.org
+push-back reactively. `capture_capacity()` and `system_status()` let a
+caller ask proactively, before spending requests — cheaper than finding out
+by getting refused:
+
+```python
+capacity = spn_client.capture_capacity(access_key=ACCESS_KEY, secret_key=SECRET_KEY)
+if capacity["known"] and capacity["daily_exhausted"]:
+    ...  # stop submitting for today — quota is used up, not "we're unlucky"
+
+status = spn_client.system_status(access_key=ACCESS_KEY, secret_key=SECRET_KEY)
+note = spn_client.service_health_note(status)
+if note:
+    log.warning("submission failing; %s", note)  # names who's at fault before you go digging
+```
+
+`system_status()`/`service_health_note()` are meant to be called once per
+run, only after something has already gone wrong — a healthy run pays
+nothing for asking. `capture_capacity()` is cheap enough to check before a
+large batch, since a wrong or stale reading can only make a run *more*
+cautious, never less.
+
+### Comparing an archived copy to the live page
+
+A snapshot URL from `check()`/`submit()`/`check_job_status()` renders with
+archive.org's own banner and URL-rewriting shim injected — not useful if
+you want to diff the archived bytes against the live page. `snapshot_raw_url()`
+gives you the unmodified capture instead:
+
+```python
+raw_url = spn_client.snapshot_raw_url(status["snapshot_url"])
+```
+
 ## What this doesn't do
 
 This is the archive.org client only — it has no opinion about:
@@ -121,6 +198,34 @@ This is the archive.org client only — it has no opinion about:
   status-code filtering) — that's what archive.org's separate
   [CDX Server API](https://github.com/internetarchive/wayback/tree/master/wayback-cdx-server)
   is for. This library only ever asks for the single closest snapshot.
+
+### Where the responsibility line is, and why
+
+The rule: **anything whose correct answer depends on archive.org's own API
+behavior lives in this library**, because every caller needs the same
+correct answer and shouldn't have to rediscover it — which errors are worth
+retrying, how fast an endpoint actually tolerates being called, what a
+response field means. **Anything whose correct answer depends on what a
+specific caller wants to do with that information is a caller-side
+concern**, because different callers legitimately want different things
+done with the same honest input — how long to keep retrying, when local
+state is safe to delete, how a report should phrase "not yet archived."
+This library does the first job and deliberately stops short of the
+second — see the batch/report examples above.
+
+The most common way to get this wrong from the caller side: treating
+`submit()`'s `submitted: True` as if it meant `archived: True`. For the
+authenticated path, a successful submission only means archive.org
+*queued* the capture — confirming it actually happened means polling
+`check_job_status(job_id, ...)` afterward and checking its `state`, not
+assuming a queued job succeeded. This library keeps `submitted` and
+`archived` as separate fields specifically so that mistake can't happen by
+accident — but it can still happen if a caller only reads `submitted` and
+never looks at `job_id` or `archived` at all. If you're deciding whether
+something is safe to treat as durably archived (safe to prune a local
+copy of, cite as a permanent source, etc.), the answer is `archived`
+(from `check()` or `submit()`) or a `check_job_status()` call that
+returned `state: "success"` — never `submitted` alone.
 
 ## References
 
