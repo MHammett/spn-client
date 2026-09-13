@@ -1,17 +1,53 @@
 [project]
 name = "spn-client"
-version = "0.3.0"
+version = "0.3.1"
 description = "A hardened client for archive.org's availability and Save Page Now (SPN2) APIs — process-wide rate pacing with a circuit breaker, dual-mode anonymous/S3-authenticated submission, and an explicit archive-outcome vocabulary."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
+keywords = [
+    "archive.org",
+    "wayback-machine",
+    "save-page-now",
+    "spn2",
+    "web-archiving",
+    "rate-limiting",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Archiving",
+    "Typing :: Typed",
+]
 dependencies = [
     "requests>=2.31.0,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-socket>=0.7",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-requests>=2.31",
+    "build>=1.2",
+    "twine>=5.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/MHammett/spn-client"
 Issues = "https://github.com/MHammett/spn-client/issues"
+Changelog = "https://github.com/MHammett/spn-client/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]

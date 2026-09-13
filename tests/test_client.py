@@ -3,7 +3,8 @@
 import itertools
 import threading
 import time
-from unittest.mock import patch, MagicMock
+from typing import ClassVar
+from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
@@ -43,7 +44,34 @@ def _mock_response(payload, url="https://example.com"):
     m.json.return_value = payload
     m.raise_for_status.return_value = None
     m.url = url
+    # An unconfigured MagicMock attribute is truthy by default, and submit()
+    # checks this on the authenticated path to reject an unexpected redirect
+    # — every test building a normal 200 needs it explicitly False, or it
+    # reads as "archive.org redirected us" no matter what else is set up.
+    m.is_redirect = False
     return m
+
+
+class TestUrlValidation:
+    """``check()``/``submit()`` reject an obviously-bad url up front rather
+    than let it surface deep inside urllib3 as a cryptic traceback, or (for
+    ``None``) silently become the literal string ``"None"``."""
+
+    def test_check_rejects_none(self):
+        with pytest.raises(ValueError, match="non-empty string"):
+            wayback.check(None)
+
+    def test_check_rejects_empty_string(self):
+        with pytest.raises(ValueError, match="non-empty string"):
+            wayback.check("")
+
+    def test_check_rejects_missing_scheme(self):
+        with pytest.raises(ValueError, match="http:// or https://"):
+            wayback.check("example.com/no-scheme")
+
+    def test_submit_rejects_bad_url_too(self):
+        with pytest.raises(ValueError, match="non-empty string"):
+            wayback.submit(123)
 
 
 class TestWaybackCheck:
@@ -80,7 +108,7 @@ class TestWaybackCheck:
     def test_network_error_returns_none_archived(self):
         with patch(
             "spn_client.client.requests.get",
-            side_effect=Exception("timeout"),
+            side_effect=requests.exceptions.ConnectionError("timeout"),
         ):
             result = wayback.check("https://example.com")
         assert result["archived"] is None
@@ -105,7 +133,7 @@ class TestWaybackCheck:
         assert result["snapshot_stale"] is True
 
     def test_fresh_snapshot_not_stale(self):
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
 
         recent_ts = (datetime.now(timezone.utc) - timedelta(days=10)).strftime(
             "%Y%m%d"
@@ -127,7 +155,7 @@ class TestWaybackCheck:
         assert result["snapshot_stale"] is False
 
     def test_custom_stale_days_override(self):
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
 
         # Snapshot from 100 days ago: NOT stale at a lenient 180, but stale at
         # a stricter 90. Both passed explicitly rather than relying on
@@ -157,15 +185,13 @@ class TestWaybackCheck:
     def test_archive_url_detected_without_api_call(self):
         # A web.archive.org link is recognized from its embedded timestamp — no
         # archive-of-an-archive lookup. requests.get must not be called.
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
 
         recent = (datetime.now(timezone.utc) - timedelta(days=20)).strftime(
             "%Y%m%d"
         ) + "120000"
         url = f"https://web.archive.org/web/{recent}/https://example.com/article"
-        with patch(
-            "spn_client.client.requests.get"
-        ) as mock_get:
+        with patch("spn_client.client.requests.get") as mock_get:
             result = wayback.check(url)
         mock_get.assert_not_called()
         assert result["is_archive_url"] is True
@@ -180,7 +206,7 @@ class TestWaybackCheck:
         assert result["snapshot_stale"] is True
 
     def test_archive_url_respects_custom_stale_days(self):
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
 
         ts = (datetime.now(timezone.utc) - timedelta(days=100)).strftime(
             "%Y%m%d"
@@ -239,7 +265,7 @@ class TestWaybackSubmit:
     def test_submit_failure_does_not_raise(self):
         with patch(
             "spn_client.client.requests.get",
-            side_effect=Exception("rate limited"),
+            side_effect=requests.exceptions.ConnectionError("rate limited"),
         ):
             result = wayback.submit("https://example.com")
         assert result["submitted"] is False
@@ -248,7 +274,7 @@ class TestWaybackSubmit:
     def test_submit_authenticated_failure_redacts_secret(self):
         with patch(
             "spn_client.client.requests.post",
-            side_effect=Exception("auth failed for SK456"),
+            side_effect=requests.exceptions.ConnectionError("auth failed for SK456"),
         ):
             result = wayback.submit(
                 "https://example.com",
@@ -318,14 +344,14 @@ class TestRateLimitGuard:
             ),
             patch.object(wayback, "_MIN_INTERVAL_SECONDS", 0.0),
             patch.object(wayback, "_BACKOFF_BASE_SECONDS", 0.0),
+            concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool,
         ):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-                list(
-                    pool.map(
-                        lambda i: wayback.check(f"https://example.com/{i}"),
-                        range(24),
-                    )
+            list(
+                pool.map(
+                    lambda i: wayback.check(f"https://example.com/{i}"),
+                    range(24),
                 )
+            )
 
         assert wayback.rate_limited_out() is True
 
@@ -570,9 +596,7 @@ class TestSubmitPacing:
         resp_429.raise_for_status.side_effect = None  # 429 short-circuits before this
         with (
             patch.object(wayback.time, "sleep"),
-            patch(
-                "spn_client.client.requests.get", return_value=resp_429
-            ) as mock_get,
+            patch("spn_client.client.requests.get", return_value=resp_429) as mock_get,
         ):
             result = wayback.submit("https://example.com/")
         assert mock_get.call_count == wayback._MAX_ATTEMPTS
@@ -620,6 +644,21 @@ class TestSubmitEstablishesWhatItCan:
     returns nothing, and ``submitted: True`` was recording them identically."""
 
     ARCHIVE = "https://web.archive.org/web/20260905121627/https://example.com/"
+
+    def test_authenticated_path_rejects_an_unexpected_redirect(self):
+        """The authenticated endpoint answers with a JSON body, never a
+        redirect — unlike the anonymous path, where the redirect *is* the
+        mechanism. A 3xx here is surfaced as a failure, not silently followed
+        into whatever ``resp.json()`` makes of a redirect body."""
+        resp = _mock_response({"job_id": "spn2-x"})
+        resp.is_redirect = True
+        resp.status_code = 302
+        with patch("spn_client.client.requests.post", return_value=resp):
+            result = wayback.submit(
+                "https://example.com/", access_key="AK", secret_key="SK"
+            )
+        assert result["submitted"] is False
+        assert "redirect" in result["error"]
 
     def test_the_redirect_target_is_kept_as_the_snapshot(self):
         """The unauthenticated endpoint captures inline and 302s to the result.
@@ -708,7 +747,7 @@ class TestSubmitEstablishesWhatItCan:
         """Callers read ``job_id`` unconditionally; a failure must not KeyError."""
         with patch(
             "spn_client.client.requests.get",
-            side_effect=Exception("boom"),
+            side_effect=requests.exceptions.ConnectionError("boom"),
         ):
             result = wayback.submit("https://example.com/")
         assert result["submitted"] is False
@@ -853,7 +892,9 @@ class TestCheckJobStatus:
                 }
             )
         )
-        assert result["screenshot_url"] == "https://web.archive.org/web/.../screenshot.png"
+        assert (
+            result["screenshot_url"] == "https://web.archive.org/web/.../screenshot.png"
+        )
         assert result["duration_seconds"] == 4.2
         assert result["resources"] == ["https://example.com/style.css"]
         assert result["outlinks"] == {"https://example.com/other": "spn2-def456"}
@@ -897,7 +938,9 @@ class TestCheckJobStatus:
         assert "unknown, not failed" in result["reason"]
 
     def test_a_transport_error_never_raises(self):
-        result, _ = self._call(side_effect=Exception("connection reset"))
+        result, _ = self._call(
+            side_effect=requests.exceptions.ConnectionError("connection reset")
+        )
         assert result["state"] == "unknown"
         assert result["reason"]
 
@@ -933,7 +976,8 @@ class TestCheckJobStatus:
 
     def test_the_secret_is_redacted_out_of_an_error(self):
         result, _ = self._call(
-            side_effect=Exception("auth failed for SK456"), secret_key="SK456"
+            side_effect=requests.exceptions.ConnectionError("auth failed for SK456"),
+            secret_key="SK456",
         )
         assert "SK456" not in result["reason"]
 
@@ -948,9 +992,7 @@ class TestCheckJobStatus:
         mock_get.assert_not_called()
 
     def test_no_job_id_means_no_call_at_all(self):
-        with patch(
-            "spn_client.client.requests.get"
-        ) as mock_get:
+        with patch("spn_client.client.requests.get") as mock_get:
             result = wayback.check_job_status(None, access_key="AK", secret_key="SK")
         assert result["state"] == "not_checked"
         mock_get.assert_not_called()
@@ -1067,7 +1109,9 @@ class TestCaptureOptions:
         credential is just as much a secret as the S3 key pair."""
         with patch(
             "spn_client.client.requests.post",
-            side_effect=Exception("login failed with password hunter2"),
+            side_effect=requests.exceptions.ConnectionError(
+                "login failed with password hunter2"
+            ),
         ):
             result = wayback.submit(
                 "https://example.com/",
@@ -1078,9 +1122,7 @@ class TestCaptureOptions:
         assert "hunter2" not in result["error"]
 
     def test_capture_cookie_and_user_agent_are_forwarded(self):
-        data = self._post(
-            capture_cookie="session=abc123", use_user_agent="MyBot/1.0"
-        )
+        data = self._post(capture_cookie="session=abc123", use_user_agent="MyBot/1.0")
         assert data["capture_cookie"] == "session=abc123"
         assert data["use_user_agent"] == "MyBot/1.0"
 
@@ -1093,7 +1135,9 @@ class TestCaptureOptions:
         the S3 key pair or a target_password — it can carry a login session."""
         with patch(
             "spn_client.client.requests.post",
-            side_effect=Exception("capture failed, cookie session=abc123 rejected"),
+            side_effect=requests.exceptions.ConnectionError(
+                "capture failed, cookie session=abc123 rejected"
+            ),
         ):
             result = wayback.submit(
                 "https://example.com/",
@@ -1117,12 +1161,8 @@ class TestSubmitHonoursTheBreaker:
         the more expensive call, since it starts a real capture — kept firing."""
         wayback._rate_limited_lookups = wayback._CIRCUIT_TRIP_AFTER
         with (
-            patch(
-                "spn_client.client.requests.get"
-            ) as mock_get,
-            patch(
-                "spn_client.client.requests.post"
-            ) as mock_post,
+            patch("spn_client.client.requests.get") as mock_get,
+            patch("spn_client.client.requests.post") as mock_post,
         ):
             result = wayback.submit("https://example.com/")
         mock_get.assert_not_called()
@@ -1151,7 +1191,7 @@ class TestCaptureCapacity:
     def teardown_method(self):
         wayback.reset_rate_limit_state()
 
-    LIVE = {
+    LIVE: ClassVar = {
         "processing": 0,
         "available": 3,
         "daily_captures": 49,
@@ -1164,7 +1204,16 @@ class TestCaptureCapacity:
         with (
             patch(
                 "spn_client.client.requests.get",
-                return_value=_json_response(payload) if payload else None,
+                # `is not None`, not truthiness: an explicitly empty payload
+                # ({}) must still build a real response — it's testing "a
+                # 200 with no useful fields", not "no response configured".
+                # (Found by the narrowed except in capture_capacity(): {}
+                # used to silently fall through to `side_effect=None,
+                # return_value=None`, which crashed _paced_get on
+                # `resp.status_code` and was masked by the broad except that
+                # used to be there — the test passed for an unrelated
+                # reason.)
+                return_value=_json_response(payload) if payload is not None else None,
                 side_effect=side_effect,
             ) as mock_get,
             patch.object(wayback, "_MIN_INTERVAL_SECONDS", 0.0),
@@ -1336,7 +1385,7 @@ class TestSystemStatus:
     def teardown_method(self):
         wayback.reset_rate_limit_state()
 
-    LIVE = {
+    LIVE: ClassVar = {
         "recent_captures": 941,
         "status": "ok",
         "queues": {"spn2-captures": 0, "spn2-api": 0, "spn2-screenshots": 0},
@@ -1443,8 +1492,7 @@ class TestJobErrorCategorization:
             == "quota_exhausted"
         )
         assert (
-            wayback.categorize_job_error("error:too-many-requests")
-            == "quota_exhausted"
+            wayback.categorize_job_error("error:too-many-requests") == "quota_exhausted"
         )
         assert (
             wayback.categorize_job_error("error:max-daily-bandwidth")

@@ -35,7 +35,7 @@ _KEY_QUERY_RE = re.compile(
 )
 
 
-def redact_url_keys(text):
+def redact_url_keys(text: object) -> str:
     """Replace key/token query-parameter values in any string with [REDACTED].
 
     Provider-agnostic: works even when the key value isn't available to compare
@@ -44,7 +44,7 @@ def redact_url_keys(text):
     return _KEY_QUERY_RE.sub(r"\1[REDACTED]", str(text))
 
 
-def redact_value(text, secret):
+def redact_value(text: object, secret: str | None) -> str:
     """Replace a known secret value with [REDACTED] wherever it appears."""
     if secret and secret in str(text):
         return str(text).replace(secret, "[REDACTED]")

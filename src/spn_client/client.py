@@ -10,17 +10,118 @@ measured incident, not a speculative design.
 """
 
 import logging
+import re
 import threading
 import time
-import re
 from datetime import datetime, timezone
+from typing import Any, Literal, TypedDict
 
 import requests
 
-from spn_client._http import DEFAULT_HEADERS
 from spn_client import _redact as redact
+from spn_client._http import DEFAULT_HEADERS
 
 log = logging.getLogger(__name__)
+
+
+class CheckResult(TypedDict, total=False):
+    """Return shape of :func:`check`. ``url`` and ``archived`` are always
+    present; every other key is conditional on which branch was taken — see
+    :func:`check`'s own docstring for exactly when each applies. Modeled as
+    one permissive ``TypedDict`` rather than a discriminated union: the
+    branches share most of their fields (the four ``snapshot_*`` keys) and a
+    union would mostly duplicate this shape four times for little real
+    safety gain over `total=False`."""
+
+    url: str
+    archived: bool | None
+    is_archive_url: bool
+    snapshot_url: str
+    snapshot_ts: str
+    snapshot_age_days: int | None
+    snapshot_stale: bool
+    snapshot_status: str
+    snapshot_is_error_capture: bool
+    error: str
+
+
+class SubmitResult(TypedDict, total=False):
+    """Return shape of :func:`submit`. ``url``/``submitted``/``job_id``/
+    ``archived`` are always present; the rest are conditional — see
+    :func:`submit`'s docstring."""
+
+    url: str
+    submitted: bool
+    job_id: str | None
+    archived: bool
+    snapshot_url: str
+    snapshot_ts: str
+    snapshot_age_days: int | None
+    snapshot_stale: bool
+    outcome_unknown: bool
+    rate_limited: bool
+    error: str
+    error_summary: str
+
+
+JobState = Literal["success", "pending", "failed", "not_checked", "unknown"]
+
+
+class JobStatusResult(TypedDict, total=False):
+    """Return shape of :func:`check_job_status`. ``job_id``/``state`` are
+    always present; the rest are conditional on ``state`` — see that
+    function's docstring for exactly which fields go with which state."""
+
+    job_id: str | None
+    state: JobState
+    reason: str | None
+    snapshot_url: str
+    snapshot_ts: str
+    snapshot_age_days: int | None
+    snapshot_stale: bool
+    screenshot_url: str | None
+    duration_seconds: float | None
+    resources: list[str] | None
+    outlinks: dict[str, str] | None
+    error_code: str | None
+    retry_category: str | None
+    raw_error: str
+
+
+class SnapshotState(TypedDict):
+    """The four fields ``check()``, ``submit()`` and ``check_job_status()``
+    all report the same way — see ``_snapshot_state``."""
+
+    snapshot_url: str
+    snapshot_ts: str
+    snapshot_age_days: int | None
+    snapshot_stale: bool
+
+
+class CaptureCapacityResult(TypedDict):
+    """Return shape of :func:`capture_capacity` — every key is always
+    present (unlike the other results here), which is why this one is a
+    plain, non-``total=False`` TypedDict."""
+
+    available: int | None
+    processing: int | None
+    daily_captures: int | None
+    daily_captures_limit: int | None
+    daily_exhausted: bool
+    known: bool
+    reason: str | None
+
+
+class SystemStatusResult(TypedDict):
+    """Return shape of :func:`system_status` — every key always present."""
+
+    ok: bool | None
+    status: str
+    recent_captures: int | None
+    busiest_queue: tuple[str, int] | None
+    known: bool
+    reason: str | None
+
 
 _AVAILABILITY_API = "https://archive.org/wayback/available"
 _SAVE_API = "https://web.archive.org/save"
@@ -71,7 +172,7 @@ ARCHIVE_OUTCOME_LABELS = {
 }
 
 
-def _age_days_from_timestamp(ts):
+def _age_days_from_timestamp(ts: str) -> int | None:
     """Days since a Wayback timestamp (YYYYMMDD...), or None if unparseable."""
     if len(ts) >= 8:
         try:
@@ -152,7 +253,7 @@ _blocked_until = 0.0
 _rate_limited_lookups = 0
 
 
-def reset_rate_limit_state():
+def reset_rate_limit_state() -> None:
     """Clear the pacing clock, the backoff, and the circuit breaker.
 
     Call this at the start of every run. The state is process-wide, so without
@@ -167,20 +268,23 @@ def reset_rate_limit_state():
         _rate_limited_lookups = 0
 
 
-def rate_limited_out():
+def rate_limited_out() -> bool:
     """True once the circuit breaker has tripped for this run."""
     with _pace_lock:
         return _rate_limited_lookups >= _CIRCUIT_TRIP_AFTER
 
 
-def _pace(min_interval=None):
+def _pace(min_interval: float | None = None) -> None:
     """Block until the shared clock allows another call.
 
     Waits for whichever is later: ``min_interval`` (default
     ``_MIN_INTERVAL_SECONDS``) since the last call, or the end of a backoff
     that a 429 imposed on every thread. Sleeping while holding the lock is
     deliberate — it is exactly what makes the interval process-wide instead
-    of per-thread.
+    of per-thread. The trade-off: ``_pace_lock`` is a full serialization
+    point for every call this module makes, not just a guard around a few
+    integer reads — two threads calling ``check()`` at once genuinely wait
+    on each other here, by design, not by accident.
 
     A caller asking for a wider interval (``submit()``, per archive.org's
     documented per-minute capture limits) still moves the *one* shared clock
@@ -200,23 +304,23 @@ def _pace(min_interval=None):
         _last_call_at = time.monotonic()
 
 
-def _note_rate_limited(retry_after):
+def _note_rate_limited(retry_after: float) -> None:
     """Back every thread off after a 429, not just the one that hit it."""
     global _blocked_until
     with _pace_lock:
         _blocked_until = max(_blocked_until, time.monotonic() + retry_after)
 
 
-def _note_lookup_refused():
+def _note_lookup_refused() -> None:
     """Count one lookup that never got past a 429."""
     global _rate_limited_lookups
     with _pace_lock:
         _rate_limited_lookups += 1
 
 
-def _retry_after_seconds(resp, attempt):
+def _retry_after_seconds(resp: requests.Response | None, attempt: int) -> float:
     """Seconds to wait before retrying, preferring the server's own answer."""
-    header = (resp.headers or {}).get("Retry-After") if resp is not None else None
+    header = resp.headers.get("Retry-After") if resp is not None else None
     if header:
         try:
             return min(float(header), 60.0)
@@ -225,7 +329,12 @@ def _retry_after_seconds(resp, attempt):
     return _BACKOFF_BASE_SECONDS * (2**attempt)
 
 
-def _paced_get(endpoint, timeout, params=None, headers=None):
+def _paced_get(
+    endpoint: str,
+    timeout: float,
+    params: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> requests.Response:
     """GET an archive.org endpoint with pacing, backoff, and a circuit breaker.
 
     Raises the last exception if every attempt fails, so the caller's existing
@@ -254,7 +363,7 @@ def _paced_get(endpoint, timeout, params=None, headers=None):
                 timeout=timeout,
                 headers=headers or DEFAULT_HEADERS,
             )
-        except Exception as exc:
+        except requests.exceptions.RequestException as exc:
             last_exc = exc
             continue
         if resp.status_code == 429:
@@ -270,15 +379,18 @@ def _paced_get(endpoint, timeout, params=None, headers=None):
     # One refused lookup, however many attempts it took to establish that.
     if rate_limited:
         _note_lookup_refused()
+    assert last_exc is not None, "loop always sets last_exc before falling through"
     raise last_exc
 
 
-def _get_availability(url, timeout):
+def _get_availability(url: str, timeout: float) -> requests.Response:
     """GET the availability API through the shared pacing/backoff/breaker path."""
     return _paced_get(_AVAILABILITY_API, timeout, params={"url": url})
 
 
-def _paced_submit(method, endpoint, timeout, min_interval, **kwargs):
+def _paced_submit(
+    method: str, endpoint: str, timeout: float, min_interval: float, **kwargs: Any
+) -> requests.Response:
     """POST/GET a capture request with pacing, the shared circuit breaker, and
     retry — but only for a *confirmed* refusal, not an ambiguous one.
 
@@ -312,10 +424,11 @@ def _paced_submit(method, endpoint, timeout, min_interval, **kwargs):
             continue
         return resp
     _note_lookup_refused()
+    assert last_exc is not None, "loop always sets last_exc before falling through"
     raise last_exc
 
 
-def _transport_failure_summary(exc, what):
+def _transport_failure_summary(exc: Exception, what: str) -> str:
     """One reader-facing sentence for an archive.org call that did not complete.
 
     The raw exception is for the log, not for whoever reads a report built on
@@ -342,7 +455,7 @@ def _transport_failure_summary(exc, what):
     return f"the request to archive.org {what} failed"
 
 
-def snapshot_raw_url(snapshot_url):
+def snapshot_raw_url(snapshot_url: str | None) -> str | None:
     """The ``id_`` form of a snapshot URL: the original captured bytes.
 
     ``https://web.archive.org/web/<ts>/<url>`` serves the capture with
@@ -373,7 +486,9 @@ def snapshot_raw_url(snapshot_url):
     )
 
 
-def _snapshot_state(snapshot_url, ts, stale_days=None):
+def _snapshot_state(
+    snapshot_url: str, ts: str, stale_days: int | None = None
+) -> SnapshotState:
     """The four snapshot fields every caller reports, from a URL and timestamp.
 
     One implementation because ``check()``, ``submit()`` and
@@ -392,7 +507,26 @@ def _snapshot_state(snapshot_url, ts, stale_days=None):
     }
 
 
-def check(url, timeout=10, stale_days=None):
+def _validate_url(url: Any) -> None:
+    """Raise a clear ``ValueError`` for a ``url`` that isn't one, rather than
+    let a bad caller input surface many calls deep as a cryptic urllib3
+    traceback (a ``None`` silently becomes the literal string ``"None"`` in
+    an f-string-built request path) or a confusing non-JSON-response error
+    that looks like an archive.org problem instead of a caller one.
+
+    Deliberately minimal — this is a caller-input sanity check, not a
+    security boundary. Modern ``http.client`` already rejects embedded
+    CR/LF in a request line (post-CVE-2016-5699), so this isn't guarding
+    against request smuggling; it's guarding against a confusing failure
+    mode for an honest mistake.
+    """
+    if not isinstance(url, str) or not url:
+        raise ValueError(f"url must be a non-empty string, got {url!r}")
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        raise ValueError(f"url must start with http:// or https://, got {url!r}")
+
+
+def check(url: str, timeout: float = 10, stale_days: int | None = None) -> CheckResult:
     """Check if a URL has a Wayback Machine snapshot and how fresh it is.
 
     If ``url`` is itself a Wayback Machine snapshot link, it is recognized as
@@ -410,10 +544,11 @@ def check(url, timeout=10, stale_days=None):
       snapshot_stale  bool         — True when older than the stale threshold
       error           str          — set only on network/parse failure
     """
+    _validate_url(url)
     # The link is already a Wayback snapshot — read its date from the URL itself.
     m = _ARCHIVE_URL_RE.search(url)
     if m:
-        result = {"url": url, "archived": True, "is_archive_url": True}
+        result: CheckResult = {"url": url, "archived": True, "is_archive_url": True}
         result.update(_snapshot_state(url, m.group(1), stale_days))
         return result
 
@@ -430,9 +565,15 @@ def check(url, timeout=10, stale_days=None):
         }
     try:
         resp = _get_availability(url, timeout)
-    except Exception as exc:
-        log.debug("Wayback availability check failed for %s: %s", url, exc)
-        return {"url": url, "archived": None, "error": str(exc)}
+    except requests.exceptions.RequestException as exc:
+        # redact_url_keys, not a fixed-value redact: check() takes no secret
+        # of its own, but ``url`` is caller-supplied and may itself carry a
+        # query-string API key/token (a paywalled or private page a caller
+        # is checking) — that would otherwise round-trip straight into this
+        # error and any log/report built on it.
+        err = redact.redact_url_keys(str(exc))
+        log.debug("Wayback availability check failed for %s: %s", url, err)
+        return {"url": url, "archived": None, "error": err}
 
     try:
         data = resp.json()
@@ -525,18 +666,18 @@ _CAPTURE_OPTIONS = {"capture_all": "0"}
 
 
 def _capture_params(
-    url,
-    stale_days=None,
-    capture_screenshot=False,
-    outlinks_availability=False,
-    skip_first_archive=False,
-    js_behavior_timeout=None,
-    target_username=None,
-    target_password=None,
-    capture_cookie=None,
-    use_user_agent=None,
-    delay_wb_availability=False,
-):
+    url: str,
+    stale_days: int | None = None,
+    capture_screenshot: bool = False,
+    outlinks_availability: bool = False,
+    skip_first_archive: bool = False,
+    js_behavior_timeout: int | None = None,
+    target_username: str | None = None,
+    target_password: str | None = None,
+    capture_cookie: str | None = None,
+    use_user_agent: str | None = None,
+    delay_wb_availability: bool = False,
+) -> dict[str, str]:
     """Form fields for one authenticated capture request.
 
     ``if_not_archived_within`` is deliberately NOT sent, and it is worth saying
@@ -586,21 +727,21 @@ def _capture_params(
 
 
 def submit(
-    url,
-    timeout=120,
-    access_key=None,
-    secret_key=None,
-    stale_days=None,
-    capture_screenshot=False,
-    outlinks_availability=False,
-    skip_first_archive=False,
-    js_behavior_timeout=None,
-    target_username=None,
-    target_password=None,
-    capture_cookie=None,
-    use_user_agent=None,
-    delay_wb_availability=False,
-):
+    url: str,
+    timeout: float = 120,
+    access_key: str | None = None,
+    secret_key: str | None = None,
+    stale_days: int | None = None,
+    capture_screenshot: bool = False,
+    outlinks_availability: bool = False,
+    skip_first_archive: bool = False,
+    js_behavior_timeout: int | None = None,
+    target_username: str | None = None,
+    target_password: str | None = None,
+    capture_cookie: str | None = None,
+    use_user_agent: str | None = None,
+    delay_wb_availability: bool = False,
+) -> SubmitResult:
     """Request that archive.org capture and archive ``url`` (Save Page Now / SPN2).
 
     Returns what was *established*, not merely what was asked for. The two
@@ -622,6 +763,16 @@ def submit(
     reported here as ``outcome_unknown`` (a timeout, not a refusal) but an
     avoidable one. The authenticated path only queues the job and returns
     immediately, so the longer default costs it nothing.
+
+    Worth naming the tension here rather than pretending there isn't one:
+    Internet Archive's own official Go client (gospn) uses a flat 40s
+    timeout for every call it makes, including this one. We're choosing to
+    trust the documented 2-minute ceiling over gospn's own more conservative
+    number, on the reasoning that a client-side timeout that's too short has
+    a real cost (a false "timeout" on a real capture) while one that's too
+    long mainly costs wall-clock time on a call this function doesn't block
+    a caller's own event loop on. Reconsider if evidence turns up that
+    captures reliably finish well under 120s in practice.
 
     **Authenticated** (``POST /save`` with an S3-style key pair from
     https://archive.org/account/s3.php): the capture is queued and the response
@@ -671,6 +822,7 @@ def submit(
     trade-off some callers want, e.g. to avoid a race with their own
     not-yet-published content).
     """
+    _validate_url(url)
     # The breaker exists because archive.org throttles per IP across endpoints.
     # A naive submission path ignores it: once five lookups had been refused,
     # the availability API goes quiet while Save Page Now — the *more*
@@ -722,10 +874,27 @@ def submit(
                     delay_wb_availability=delay_wb_availability,
                 ),
                 headers=headers,
+                # The authenticated endpoint answers with a JSON body, not a
+                # redirect — IA's own official SPN2 client (gospn) explicitly
+                # disables redirect-following on every call it makes, treating
+                # any 3xx here as itself suspect rather than something to
+                # transparently follow. Same reasoning applies: a redirect on
+                # this specific path is not a documented, expected response.
+                allow_redirects=False,
             )
+            if resp.is_redirect:
+                # raise_for_status() would not catch this — 3xx isn't an
+                # error status — but it's not the documented JSON response
+                # either, so surface it explicitly rather than pass a
+                # redirect body to json() and report whatever confusing
+                # parse failure comes out the other side.
+                raise requests.exceptions.RequestException(
+                    f"unexpected redirect ({resp.status_code}) from the "
+                    f"authenticated capture endpoint"
+                )
             resp.raise_for_status()
             payload = resp.json()
-            result = {
+            result: SubmitResult = {
                 "url": url,
                 "submitted": True,
                 "job_id": payload.get("job_id"),
@@ -746,17 +915,32 @@ def submit(
             return result
 
         resp = _paced_submit(
-            "get", f"{_SAVE_API}/{url}", timeout, min_interval, headers=headers
+            "get",
+            f"{_SAVE_API}/{url}",
+            timeout,
+            min_interval,
+            headers=headers,
+            # Unlike the authenticated path above, this one's whole mechanism
+            # *is* the redirect — the snapshot URL only ever appears as
+            # where we land, never in a response body. Explicit rather than
+            # relying on requests' default, so the asymmetry with the
+            # authenticated path above reads as deliberate, not an oversight.
+            allow_redirects=True,
         )
         resp.raise_for_status()
-        result = {"url": url, "submitted": True, "job_id": None, "archived": False}
+        result = {
+            "url": url,
+            "submitted": True,
+            "job_id": None,
+            "archived": False,
+        }
         # The capture archive.org just ran, named by the URL it redirected us to.
         m = _ARCHIVE_URL_RE.search(resp.url or "")
         if m:
             result["archived"] = True
             result.update(_snapshot_state(resp.url, m.group(1), stale_days))
         return result
-    except Exception as exc:
+    except requests.exceptions.RequestException as exc:
         err = redact.redact_value(
             redact.redact_value(
                 redact.redact_value(redact.redact_url_keys(str(exc)), secret_key),
@@ -776,7 +960,9 @@ def submit(
         # response establishes nothing was captured, so this is a real
         # refusal, not an unknown outcome.
         timed_out = isinstance(exc, requests.exceptions.Timeout)
-        rate_limited = getattr(getattr(exc, "response", None), "status_code", None) == 429
+        rate_limited = (
+            getattr(getattr(exc, "response", None), "status_code", None) == 429
+        )
         log.warning(
             "Wayback submission %s for %s: %s",
             "timed out" if timed_out else "failed",
@@ -800,8 +986,12 @@ def submit(
 
 
 def check_job_status(
-    job_id, timeout=15, access_key=None, secret_key=None, stale_days=None
-):
+    job_id: str | None,
+    timeout: float = 15,
+    access_key: str | None = None,
+    secret_key: str | None = None,
+    stale_days: int | None = None,
+) -> JobStatusResult:
     """Read the outcome of an SPN2 capture job. Never raises.
 
     **This endpoint is credential-only.** Probed 2026-09-05: both
@@ -890,7 +1080,7 @@ def check_job_status(
     headers["Accept"] = "application/json"
     try:
         resp = _paced_get(f"{_SAVE_STATUS_API}/{job_id}", timeout, headers=headers)
-    except Exception as exc:
+    except requests.exceptions.RequestException as exc:
         err = redact.redact_value(redact.redact_url_keys(str(exc)), secret_key)
         status_code = getattr(getattr(exc, "response", None), "status_code", None)
         if status_code == 401:
@@ -939,7 +1129,7 @@ def check_job_status(
                     "timestamp/original_url, so no snapshot URL can be given"
                 ),
             }
-        result = {"job_id": job_id, "state": "success", "reason": None}
+        result: JobStatusResult = {"job_id": job_id, "state": "success", "reason": None}
         result.update(
             _snapshot_state(
                 f"https://web.archive.org/web/{ts}/{original}", ts, stale_days
@@ -997,7 +1187,9 @@ def check_job_status(
     }
 
 
-def capture_capacity(timeout=15, access_key=None, secret_key=None):
+def capture_capacity(
+    timeout: float = 15, access_key: str | None = None, secret_key: str | None = None
+) -> CaptureCapacityResult:
     """How much Save Page Now capacity this account has right now. Never raises.
 
     ``GET /save/status/user``, credential-only like the job-status endpoint.
@@ -1026,13 +1218,14 @@ def capture_capacity(timeout=15, access_key=None, secret_key=None):
       known                bool       — False when we could not find out
       reason               str | None — why not, when ``known`` is False
     """
-    unknown = {
+    unknown: CaptureCapacityResult = {
         "available": None,
         "processing": None,
         "daily_captures": None,
         "daily_captures_limit": None,
         "daily_exhausted": False,
         "known": False,
+        "reason": None,
     }
     if not (access_key and secret_key):
         return {
@@ -1056,12 +1249,30 @@ def capture_capacity(timeout=15, access_key=None, secret_key=None):
     headers["Accept"] = "application/json"
     try:
         resp = _paced_get(_SAVE_USER_STATUS_API, timeout, headers=headers)
-        data = resp.json()
-    except Exception as exc:
-        log.debug("Wayback capture-capacity lookup failed: %s", exc)
+    except requests.exceptions.RequestException as exc:
+        # Redact before logging, not just before returning: `_transport_
+        # failure_summary` below never embeds the raw exception text, but
+        # the debug log line does, and this exception can carry the
+        # Authorization header's credentials in its message (e.g. a
+        # requests.exceptions.InvalidHeader if a key ever contained a
+        # control character).
+        err = redact.redact_value(redact.redact_url_keys(str(exc)), secret_key)
+        log.debug("Wayback capture-capacity lookup failed: %s", err)
         return {
             **unknown,
             "reason": _transport_failure_summary(exc, "for capture capacity"),
+        }
+    try:
+        data = resp.json()
+    except ValueError:
+        # Same misdirection guard as check()/check_job_status(): a 200 that
+        # isn't JSON is an error or challenge page, not a parser bug.
+        return {
+            **unknown,
+            "reason": (
+                f"archive.org returned a non-JSON {resp.status_code} response "
+                f"({len(resp.content)} bytes) from the capture-capacity API"
+            ),
         }
 
     def _int(key):
@@ -1084,7 +1295,9 @@ def capture_capacity(timeout=15, access_key=None, secret_key=None):
     }
 
 
-def system_status(timeout=15, access_key=None, secret_key=None):
+def system_status(
+    timeout: float = 15, access_key: str | None = None, secret_key: str | None = None
+) -> SystemStatusResult:
     """Is archive.org's capture system healthy, or are we the problem? Never raises.
 
     ``GET /save/status/system``. Measured live 2026-09-06::
@@ -1109,12 +1322,13 @@ def system_status(timeout=15, access_key=None, secret_key=None):
       known            bool       — False when we could not find out
       reason           str | None
     """
-    unknown = {
+    unknown: SystemStatusResult = {
         "ok": None,
         "status": "",
         "recent_captures": None,
         "busiest_queue": None,
         "known": False,
+        "reason": None,
     }
     if rate_limited_out():
         # Deliberately still asks nothing: the breaker exists because further
@@ -1133,12 +1347,24 @@ def system_status(timeout=15, access_key=None, secret_key=None):
         headers["Authorization"] = f"LOW {access_key}:{secret_key}"
     try:
         resp = _paced_get(_SAVE_SYSTEM_STATUS_API, timeout, headers=headers)
-        data = resp.json()
-    except Exception as exc:
-        log.debug("Wayback system-status lookup failed: %s", exc)
+    except requests.exceptions.RequestException as exc:
+        # See capture_capacity()'s matching comment: redact before logging,
+        # since this call can carry credentials in its Authorization header.
+        err = redact.redact_value(redact.redact_url_keys(str(exc)), secret_key)
+        log.debug("Wayback system-status lookup failed: %s", err)
         return {
             **unknown,
             "reason": _transport_failure_summary(exc, "for its service status"),
+        }
+    try:
+        data = resp.json()
+    except ValueError:
+        return {
+            **unknown,
+            "reason": (
+                f"archive.org returned a non-JSON {resp.status_code} response "
+                f"({len(resp.content)} bytes) from the system-status API"
+            ),
         }
 
     status = str(data.get("status") or "").strip()
@@ -1229,16 +1455,18 @@ _JOB_ERROR_CATEGORIES = {
 }
 
 
-def categorize_job_error(status_ext):
-    """"permanent" / "transient" / "quota_exhausted" for a known SPN2
+def categorize_job_error(status_ext: str | None) -> str | None:
+    """ "permanent" / "transient" / "quota_exhausted" for a known SPN2
     ``status_ext`` code, or ``None`` for one this table doesn't recognize
     (including no code at all). See ``_JOB_ERROR_CATEGORIES`` for what each
     bucket means and why "unknown" is deliberately not folded into one.
     """
+    if status_ext is None:
+        return None
     return _JOB_ERROR_CATEGORIES.get(status_ext)
 
 
-def service_health_note(status):
+def service_health_note(status: SystemStatusResult | None) -> str | None:
     """One clause naming who was at fault, or None when it adds nothing.
 
     Returns None for a healthy service *and* for an unknown one: appending

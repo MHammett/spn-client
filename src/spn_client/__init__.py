@@ -9,6 +9,11 @@ from spn_client.client import (
     ARCHIVE_SUBMIT_FAILED,
     ARCHIVE_SUBMITTED,
     DEFAULT_STALE_DAYS,
+    CaptureCapacityResult,
+    CheckResult,
+    JobStatusResult,
+    SubmitResult,
+    SystemStatusResult,
     capture_capacity,
     categorize_job_error,
     check,
@@ -21,7 +26,7 @@ from spn_client.client import (
     system_status,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "ARCHIVE_ARCHIVED",
@@ -29,9 +34,14 @@ __all__ = [
     "ARCHIVE_NOT_ATTEMPTED",
     "ARCHIVE_OUTCOME_LABELS",
     "ARCHIVE_PENDING",
-    "ARCHIVE_SUBMIT_FAILED",
     "ARCHIVE_SUBMITTED",
+    "ARCHIVE_SUBMIT_FAILED",
     "DEFAULT_STALE_DAYS",
+    "CaptureCapacityResult",
+    "CheckResult",
+    "JobStatusResult",
+    "SubmitResult",
+    "SystemStatusResult",
     "capture_capacity",
     "categorize_job_error",
     "check",
