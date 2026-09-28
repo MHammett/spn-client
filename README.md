@@ -279,6 +279,15 @@ Issues this project has filed or commented on upstream, with what it found:
 - [internetarchive/wayback#304](https://github.com/internetarchive/wayback/issues/304)
   — `error:no-captures` is a real SPN2 status code absent from the SPN2 docs
   above; found live, added to `categorize_job_error()` in 0.2.1.
+- [internetarchive/wayback#305](https://github.com/internetarchive/wayback/issues/305)
+  — the SPN2 doc gives the per-URL daily capture limit as 10 (error table) and
+  5 (limits section), a live refusal said 1 "for that Resource type", and the
+  doc does not show that a refusal can arrive at request time as an HTTP 200
+  with `status: "error"`. See `submit()`'s docstring.
+- [internetarchive/wayback#306](https://github.com/internetarchive/wayback/issues/306)
+  — the availability API returned a 2024 capture while a newer `warc/revisit`
+  capture existed and resolved, so an unchanged page can look stale forever.
+  The reason for `check(cdx_fallback=True)`.
 
 ## Contributing
 
