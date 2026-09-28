@@ -698,8 +698,10 @@ def check(
     2. *It can answer empty for URLs that have captures.* Reported 2026-09-24 in
        cyanheads/internet-archive-mcp-server#27: ``archived_snapshots: {}`` for
        nasa.gov, www.nasa.gov and wikipedia.org, while CDX listed a capture for
-       nasa.gov. Not reproduced when measured here on 2026-09-28 (nasa.gov
-       answered normally), so treat it as episodic.
+       nasa.gov. Also internetarchive/wayback#296 (2025-09-23): empty for the
+       ``https://`` form of a URL where the scheme-less form answers. Neither
+       reproduced when measured here on 2026-09-28 (nasa.gov answered
+       normally), so treat them as episodic or URL-specific.
     3. *It lags fresh captures.* archive.org's help centre says "the Wayback
        Machine can sometimes experience delays in registering snapshots made
        using the Save Page Now tool", and that a page may show for "maybe a few

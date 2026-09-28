@@ -296,13 +296,14 @@ class TestCheckCdxFallback:
         return m
 
     def _frozen_ages(self):
-        """Pin how old a snapshot is: the 2024 capture is 411 days old and
-        anything newer is 1 day old. Without this, whether a promoted snapshot is
-        "stale" would depend on the date the suite happens to run on."""
+        """Pin how old a snapshot is: the 2024 capture is 777 days old (its real
+        age on 2026-09-28) and anything newer is 1 day old. Without this,
+        whether a promoted snapshot is "stale" would depend on the date the
+        suite happens to run on."""
         return patch.object(
             wayback,
             "_age_days_from_timestamp",
-            side_effect=lambda ts: 411 if ts.startswith("2024") else 1,
+            side_effect=lambda ts: 777 if ts.startswith("2024") else 1,
         )
 
     def _check(self, responses, **kwargs):
