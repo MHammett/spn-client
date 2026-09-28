@@ -35,6 +35,18 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
   `capture_cookie` and URL-embedded keys before it is returned, by the same
   helper the transport-failure path uses, so the two cannot drift apart.
 
+### Changed
+- `error:too-many-daily-captures` is now categorized `"transient"`, not
+  `"quota_exhausted"`. It is a cap on one URL (SPN2's own wording: "This URL
+  has been captured 10 times today"), not on the account, so
+  `"quota_exhausted"` — which tells a caller to stop submitting everything —
+  was halting runs that had nothing else wrong with them. `error_code` still
+  names the cause for a caller that wants to retry that URL tomorrow. The
+  evidence is in the comment on its `_JOB_ERROR_CATEGORIES` entry.
+  **Behavior change** for any caller that branched on `"quota_exhausted"` to
+  stop a run: this code no longer reaches that branch. Kept as its own commit
+  so it can be dropped without touching the `submit()` fix above.
+
 ## [0.3.1] — 2026-09-13
 
 A senior-engineer audit pass: security, reliability, and packaging hardening,

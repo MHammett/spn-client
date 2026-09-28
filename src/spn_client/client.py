@@ -1484,9 +1484,14 @@ def system_status(
 #:                        A batch loop should stop treating this URL as
 #:                        pending and move on, not keep re-queuing it.
 #:   "transient"        — archive.org's own infrastructure had a bad moment;
-#:                        the same URL is worth trying again later.
+#:                        the same URL is worth trying again later. Also a
+#:                        ceiling that belongs to *this URL alone* and resets
+#:                        (``error:too-many-daily-captures``): "later" then
+#:                        means after the reset, and the rest of the run is
+#:                        unaffected.
 #:   "quota_exhausted"  — a real ceiling was hit (daily/bandwidth/session
-#:                        limit). Retrying *this* URL sooner does nothing;
+#:                        limit) on the account, the IP or the target host.
+#:                        Retrying *this* URL sooner does nothing;
 #:                        the whole run should back off, not just this item.
 #:
 #: Heuristic, not a guarantee — archive.org's docs give a one-line gloss per
@@ -1533,7 +1538,29 @@ _JOB_ERROR_CATEGORIES = {
     "error:read-timeout": "transient",
     "error:soft-time-limit-exceeded": "transient",
     "error:service-unavailable": "transient",
-    "error:too-many-daily-captures": "quota_exhausted",
+    # A cap on ONE URL, not on the run, so not "quota_exhausted", which tells a
+    # caller to stop submitting everything. It was filed there on the strength
+    # of its name. Its own description in SPN2's docs is "This URL has been
+    # captured 10 times today. We cannot make any more captures." (as copied
+    # into ramazansancar/spn2's README and tweaselORG/TrackHAR's wayback.ts),
+    # and the live refusal says the same about the URL, not the account: "This
+    # URL has been already captured 1 times today, which is a daily limit we
+    # have set for that Resource type" (observed 2026-09-27). The number is not
+    # fixed: 1 in that message, 5 in nextdash's measurement ("a sixth capture of
+    # the same page in one day"), 10 in SPN2's docs, and the message ties it to
+    # the URL's "Resource type".
+    #
+    # The evidence that other URLs are unaffected: in that 2026-09-27 batch, one
+    # URL was refused for this reason while a second, submitted in the same
+    # batch, was not refused and came back with a snapshot. Under
+    # "quota_exhausted" a caller following the README would have stopped
+    # submitting after the first.
+    #
+    # "transient" is the reaction a caller needs: try this URL again, but not
+    # until archive.org's daily reset. Retrying sooner is refused again, at the
+    # cost of one paced request. ``error_code`` still names the cause for a
+    # caller that wants to schedule the retry for tomorrow.
+    "error:too-many-daily-captures": "transient",
     "error:too-many-redirects": "permanent",
     "error:too-many-requests": "quota_exhausted",
     "error:user-session-limit": "quota_exhausted",

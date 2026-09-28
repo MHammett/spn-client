@@ -1014,7 +1014,9 @@ class TestCheckJobStatus:
             )
         )
         assert result["error_code"] == "error:too-many-daily-captures"
-        assert result["retry_category"] == "quota_exhausted"
+        # A per-URL cap: this URL waits for the reset, the run carries on. See
+        # the comment on its entry in _JOB_ERROR_CATEGORIES.
+        assert result["retry_category"] == "transient"
 
     def test_error_with_no_status_ext_has_no_code_or_category(self):
         result, _ = self._call(
@@ -1633,16 +1635,43 @@ class TestJobErrorCategorization:
 
     def test_a_quota_exhausted_failure_is_categorized(self):
         assert (
-            wayback.categorize_job_error("error:too-many-daily-captures")
-            == "quota_exhausted"
-        )
-        assert (
             wayback.categorize_job_error("error:too-many-requests") == "quota_exhausted"
         )
         assert (
             wayback.categorize_job_error("error:max-daily-bandwidth")
             == "quota_exhausted"
         )
+        assert (
+            wayback.categorize_job_error("error:user-session-limit")
+            == "quota_exhausted"
+        )
+
+    def test_a_per_url_daily_cap_is_transient_not_a_run_wide_back_off(self):
+        """``quota_exhausted`` tells a caller to stop submitting everything. A
+        URL at its own daily capture cap says nothing about the next URL, so
+        filing it there stopped a run that had nothing wrong with it. The
+        evidence is on the table entry."""
+        assert (
+            wayback.categorize_job_error("error:too-many-daily-captures") == "transient"
+        )
+
+    def test_every_run_wide_quota_code_is_still_quota_exhausted(self):
+        """The counterpart: moving one code out must not have loosened the
+        bucket. The account, IP and host ceilings really do call for backing
+        off the whole run."""
+        run_wide = {
+            "error:bandwidth-limit-exceeded",
+            "error:too-many-requests",
+            "error:user-session-limit",
+            "error:max-daily-bandwidth",
+            "error:max-daily-bandwidth-from-ip",
+            "error:max-daily-bandwidth-host",
+        }
+        assert {
+            code
+            for code, category in wayback._JOB_ERROR_CATEGORIES.items()
+            if category == "quota_exhausted"
+        } == run_wide
 
     def test_an_unrecognized_code_is_none_not_a_guess(self):
         """A code archive.org adds tomorrow, or a typo, must not silently
