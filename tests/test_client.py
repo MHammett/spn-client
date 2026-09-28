@@ -1,6 +1,7 @@
 """Tests for spn_client.client (all HTTP mocked)."""
 
 import itertools
+import json
 import threading
 import time
 from typing import ClassVar
@@ -227,6 +228,312 @@ class TestWaybackCheck:
         ) as mock_get:
             wayback.check("https://example.com/normal")
         mock_get.assert_called_once()
+
+
+class TestCheckCdxFallback:
+    """``check(cdx_fallback=True)``: a second opinion from the CDX index when the
+    availability answer is "not archived" or "stale". The rows below are the real
+    ones measured 2026-09-28 for the NHTSA PDF that motivated it: an old 200
+    capture and a later ``warc/revisit`` record with the same digest, which the
+    availability API never returns."""
+
+    URL = "https://static.nhtsa.gov/odi/tsbs/2023/MC-10237044-0001.pdf"
+    DIGEST = "DMH3E3XE2CGYKJLVEOLHZFIF6WSAFMNS"
+    HEADER: ClassVar[list[str]] = [
+        "timestamp",
+        "original",
+        "mimetype",
+        "statuscode",
+        "digest",
+    ]
+    OLD_200: ClassVar[list[str]] = [
+        "20240812234508",
+        URL,
+        "application/pdf",
+        "200",
+        DIGEST,
+    ]
+    REVISIT: ClassVar[list[str]] = [
+        "20260927204213",
+        URL,
+        "warc/revisit",
+        "-",
+        DIGEST,
+    ]
+    # Far enough out that "stale" is decided by the test, not by today's date.
+    LENIENT = 36500
+
+    @pytest.fixture(autouse=True)
+    def _fresh_pacing_and_breaker(self):
+        wayback.reset_rate_limit_state()
+        with patch.object(wayback, "_MIN_INTERVAL_SECONDS", 0.0):
+            yield
+        wayback.reset_rate_limit_state()
+
+    def _availability(self, closest=None):
+        return _mock_response(
+            {"archived_snapshots": {"closest": closest} if closest else {}}
+        )
+
+    def _old_snapshot(self):
+        return self._availability(
+            {
+                "available": True,
+                "url": f"http://web.archive.org/web/20240812234508/{self.URL}",
+                "timestamp": "20240812234508",
+                "status": "200",
+            }
+        )
+
+    def _cdx(self, rows, *, header=None, text=None):
+        m = MagicMock()
+        m.status_code = 200
+        m.headers = {}
+        m.raise_for_status.return_value = None
+        data = [header or self.HEADER, *rows]
+        m.text = json.dumps(data) if text is None else text
+        m.json.return_value = data
+        return m
+
+    def _frozen_ages(self):
+        """Pin how old a snapshot is: the 2024 capture is 411 days old and
+        anything newer is 1 day old. Without this, whether a promoted snapshot is
+        "stale" would depend on the date the suite happens to run on."""
+        return patch.object(
+            wayback,
+            "_age_days_from_timestamp",
+            side_effect=lambda ts: 411 if ts.startswith("2024") else 1,
+        )
+
+    def _check(self, responses, **kwargs):
+        with patch("spn_client.client.requests.get", side_effect=responses) as get:
+            result = wayback.check(self.URL, cdx_fallback=True, **kwargs)
+        return result, get
+
+    def test_it_is_off_by_default(self):
+        with patch(
+            "spn_client.client.requests.get", return_value=self._availability()
+        ) as get:
+            result = wayback.check(self.URL)
+
+        assert get.call_count == 1
+        assert result == {"url": self.URL, "archived": False}
+
+    def test_a_revisit_of_unchanged_bytes_makes_a_stale_snapshot_current(self):
+        """The motivating case. The availability API returns the 2024 capture for
+        this URL forever, so every run called it stale and re-submitted it."""
+        with self._frozen_ages():
+            result, get = self._check(
+                [
+                    self._old_snapshot(),
+                    self._cdx([self.REVISIT]),
+                    self._cdx([self.OLD_200]),
+                ]
+            )
+
+        assert result["archived"] is True
+        assert result["found_via"] == "cdx"
+        assert result["snapshot_ts"] == "20260927204213"
+        assert (
+            result["snapshot_url"]
+            == f"https://web.archive.org/web/20260927204213/{self.URL}"
+        )
+        assert result["snapshot_is_revisit"] is True
+        # The status is the pointed-at capture's, not the revisit record's "-".
+        assert result["snapshot_status"] == "200"
+        assert result["snapshot_is_error_capture"] is False
+        assert result["snapshot_stale"] is False
+
+        latest_call, verify_call = get.call_args_list[1], get.call_args_list[2]
+        assert latest_call.kwargs["params"]["limit"] == "-1"
+        assert latest_call.kwargs["params"]["fl"] == wayback._CDX_FIELDS
+        assert verify_call.kwargs["params"]["limit"] == "1"
+        assert verify_call.kwargs["params"]["filter"] == [
+            "statuscode:200",
+            f"digest:{self.DIGEST}",
+        ]
+
+    def test_staleness_is_recomputed_for_the_promoted_snapshot(self):
+        """A promoted snapshot is judged by ``stale_days`` like any other, so a
+        caller with a policy is not handed a number computed under a default."""
+        with self._frozen_ages():
+            result, _ = self._check(
+                [
+                    self._old_snapshot(),
+                    self._cdx([self.REVISIT]),
+                    self._cdx([self.OLD_200]),
+                ],
+                stale_days=0,
+            )
+
+        assert result["found_via"] == "cdx"
+        assert result["snapshot_stale"] is True
+
+    def test_a_revisit_of_something_never_captured_well_is_not_promoted(self):
+        """Left unchecked, a page that has answered 404 for a year would be
+        reported freshly archived by its latest revisit record."""
+        result, get = self._check(
+            [self._old_snapshot(), self._cdx([self.REVISIT]), self._cdx([])]
+        )
+
+        assert get.call_count == 3
+        assert "found_via" not in result
+        assert result["snapshot_ts"] == "20240812234508"
+        assert result["snapshot_stale"] is True
+
+    def test_nothing_newer_leaves_the_availability_answer_alone(self):
+        result, get = self._check([self._old_snapshot(), self._cdx([self.OLD_200])])
+
+        assert get.call_count == 2
+        assert "found_via" not in result
+        assert result["snapshot_ts"] == "20240812234508"
+
+    def test_a_newer_error_capture_does_not_stand_in_for_a_good_older_one(self):
+        result, _ = self._check(
+            [
+                self._old_snapshot(),
+                self._cdx(
+                    [["20260927000000", self.URL, "text/html", "404", "SOMETHINGELSE"]]
+                ),
+            ]
+        )
+
+        assert "found_via" not in result
+        assert result["snapshot_ts"] == "20240812234508"
+
+    def test_no_snapshot_becomes_archived_when_cdx_holds_a_real_capture(self):
+        """The second documented failure: an availability answer that is empty
+        for a URL that has captures."""
+        newer = ["20250601000000", self.URL, "application/pdf", "200", self.DIGEST]
+        result, _ = self._check(
+            [self._availability(), self._cdx([newer])], stale_days=self.LENIENT
+        )
+
+        assert result["archived"] is True
+        assert result["found_via"] == "cdx"
+        assert result["snapshot_ts"] == "20250601000000"
+        assert result["snapshot_status"] == "200"
+        assert "snapshot_is_revisit" not in result
+
+    def test_a_promoted_snapshot_carries_none_of_the_replaced_ones_status(self):
+        """The old snapshot here was a capture of an error page; the promoted one
+        is not, and must not inherit the flag."""
+        old_error = self._availability(
+            {
+                "available": True,
+                "url": f"http://web.archive.org/web/20240101000000/{self.URL}",
+                "timestamp": "20240101000000",
+                "status": "404",
+            }
+        )
+        good = ["20260101000000", self.URL, "application/pdf", "200", self.DIGEST]
+        result, _ = self._check([old_error, self._cdx([good])])
+
+        assert result["snapshot_status"] == "200"
+        assert result["snapshot_is_error_capture"] is False
+
+    @pytest.mark.parametrize(
+        "cdx_answer",
+        [
+            {"rows": []},
+            {"rows": [], "text": ""},
+            {"rows": [], "text": "[]\n"},
+        ],
+        ids=["header-only", "empty-body", "empty-array"],
+    )
+    def test_no_captures_is_not_an_error_however_cdx_says_it(self, cdx_answer):
+        """Observed 2026-09-28: "no captures" is a 200 whose body is ``[]``."""
+        cdx = self._cdx(cdx_answer["rows"], text=cdx_answer.get("text"))
+        if cdx_answer.get("text") == "[]\n":
+            cdx.json.return_value = []
+        result, _ = self._check([self._availability(), cdx])
+
+        assert result == {"url": self.URL, "archived": False}
+
+    def test_a_fresh_availability_answer_never_reaches_cdx(self):
+        result, get = self._check([self._old_snapshot()], stale_days=self.LENIENT)
+
+        assert get.call_count == 1
+        assert result["snapshot_stale"] is False
+
+    def test_a_failed_availability_lookup_does_not_go_on_to_cdx(self):
+        result, get = self._check(requests.exceptions.ConnectionError("down"))
+
+        assert result["archived"] is None
+        assert all(call.args[0] != wayback._CDX_API for call in get.call_args_list)
+
+    def test_a_cdx_timeout_is_reported_and_changes_nothing_else(self):
+        result, get = self._check(
+            [self._availability(), requests.exceptions.ReadTimeout("slow")]
+        )
+
+        assert result["archived"] is False
+        assert (
+            "timed out" in result["cdx_error"].lower() or "slow" in result["cdx_error"]
+        )
+        # One availability request and ONE cdx request: a timeout is not retried.
+        assert get.call_count == 2
+
+    def test_cdx_getting_a_503_is_reported_not_raised(self):
+        """Observed 2026-09-28: ``503 Temporarily Offline`` after 5.9s."""
+        result, _ = self._check([self._old_snapshot(), _error_response(503)])
+
+        assert result["archived"] is True
+        assert result["snapshot_ts"] == "20240812234508"
+        assert "503" in result["cdx_error"]
+
+    def test_a_non_json_cdx_body_is_named_for_what_it_is(self):
+        page = self._cdx([], text="<html>Temporarily Offline</html>")
+        page.json.side_effect = ValueError("Expecting value: line 1 column 1")
+        result, _ = self._check([self._availability(), page])
+
+        assert (
+            result["cdx_error"]
+            == "archive.org returned a non-JSON response from the CDX API"
+        )
+
+    def test_cdx_gets_its_own_timeout(self):
+        _, get = self._check(
+            [self._availability(), self._cdx([])], timeout=7, cdx_timeout=123
+        )
+
+        assert get.call_args_list[0].kwargs["timeout"] == 7
+        assert get.call_args_list[1].kwargs["timeout"] == 123
+
+    def test_a_429_from_cdx_still_counts_toward_the_breaker(self):
+        """One attempt, so the retry is given up, but the refusal is not."""
+        result, _ = self._check([self._availability(), _rate_limited_response()])
+
+        assert "429" in result["cdx_error"]
+        assert wayback._rate_limited_lookups == 1
+
+    def test_a_tripped_breaker_skips_the_lookup(self):
+        with patch.object(wayback, "rate_limited_out", side_effect=[False, True]):
+            result, get = self._check([self._availability()])
+
+        assert get.call_count == 1
+        assert result["cdx_error"].startswith("skipped:")
+
+    def test_secrets_in_the_url_do_not_reach_cdx_error(self):
+        url = "https://private.example/doc?api_key=SEKRET"
+        with patch(
+            "spn_client.client.requests.get",
+            side_effect=[
+                self._availability(),
+                requests.exceptions.ConnectionError(f"failed for {url}"),
+            ],
+        ):
+            result = wayback.check(url, cdx_fallback=True)
+
+        assert "SEKRET" not in result["cdx_error"]
+
+    def test_an_archive_url_is_recognised_without_any_lookup(self):
+        archive_url = f"https://web.archive.org/web/20260927204213/{self.URL}"
+        with patch("spn_client.client.requests.get") as get:
+            result = wayback.check(archive_url, cdx_fallback=True)
+
+        assert result["is_archive_url"] is True
+        get.assert_not_called()
 
 
 class TestWaybackSubmit:

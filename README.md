@@ -65,6 +65,27 @@ if result["archived"] and not result.get("snapshot_stale"):
     ...  # already durably archived — nothing to do
 ```
 
+`check()` asks archive.org's availability API, and that API can be wrong about
+what it reports as "not archived" or "stale". It never returns a `warc/revisit`
+record (archive.org's pointer for unchanged content), so a page that has not
+changed can look stale forever however often it is captured; it has been
+reported answering empty for URLs that have captures; and it lags fresh
+captures by hours. Pass `cdx_fallback=True` to have `check()` ask the CDX index
+for the newest capture whenever the answer is "not archived" or "stale":
+
+```python
+result = spn_client.check(url, cdx_fallback=True)
+if result.get("found_via") == "cdx":
+    ...  # the availability API was wrong; result["snapshot_url"] is the real newest capture
+if "cdx_error" in result:
+    ...  # the CDX lookup failed; everything else is the availability answer
+```
+
+It is off by default because CDX is slow (seconds to a minute, and sometimes
+a timeout or a 503), and it does not fix the lag right after a capture (CDX
+lags too). The evidence, and how a revisit is verified before it is trusted,
+is in `check()`'s docstring.
+
 ### 2. Submit a capture if it isn't
 
 ```python

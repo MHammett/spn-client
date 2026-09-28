@@ -12,6 +12,30 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
 
 ## [Unreleased]
 
+### Added
+- `check(cdx_fallback=True, cdx_timeout=60)`: when the availability API says a
+  URL is "not archived" or "stale", ask the CDX index for the newest capture
+  and use it if it is newer and real. **Off by default; no behavior changes
+  unless a caller opts in.** Motivated by the availability API never returning
+  a `warc/revisit` record, which is archive.org's pointer for unchanged
+  content, so an unchanged page cannot become fresh through `check()` however
+  often it is captured, and a caller acting on "stale" re-submits it forever.
+  Measured 2026-09-28 for one NHTSA PDF: CDX lists a 2024-08-12 capture (200,
+  digest `DMH3E3XE…`) and a 2026-09-27 20:42:13 UTC `warc/revisit` record with
+  the *same* digest whose exact-timestamp URL answers `200 application/pdf`,
+  while the availability API returned only the 2024 capture.
+  A revisit is trusted only after a second lookup finds a `200` capture with
+  the same digest, so a page that has answered 404 for a year is not reported
+  freshly archived by its latest revisit. CDX can only promote an answer, never
+  demote one; a failed lookup is reported in `cdx_error` and changes nothing
+  else. New result keys: `found_via`, `snapshot_is_revisit`, `cdx_error`.
+  It is opt-in because CDX is slow: of seven measured queries four answered in
+  15.6s to 51.7s and three timed out, and one more got `503 Temporarily
+  Offline`. It has its own timeout and is not retried.
+  **Not a fix for the availability API's lag right after a capture** (archive.org
+  documents it, and a third-party spec measured CDX empty for the capture day
+  too); that needs a different answer.
+
 ### Fixed
 - `submit()` now reports a refusal as a refusal. archive.org answers a
   capture request it will not run — most visibly a URL that has hit its
