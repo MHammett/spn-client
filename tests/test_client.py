@@ -754,6 +754,151 @@ class TestSubmitEstablishesWhatItCan:
         assert result["job_id"] is None
 
 
+class TestARefusalArrivesAs200:
+    """archive.org answers a capture request it will not run with HTTP 200 and a
+    JSON body saying ``status: "error"``. ``submit()`` read only ``job_id`` and
+    ``message``, so it reported ``submitted: True`` — see "A refusal can arrive
+    as a 200" in its docstring for the evidence behind this body's shape."""
+
+    # The message text was observed live 2026-09-27; the surrounding fields are
+    # as jordibrouwer/nextdash, meedan/pender and MKRWW/wortlaut record them.
+    DAILY_CAP: ClassVar[dict[str, str]] = {
+        "status": "error",
+        "status_ext": "error:too-many-daily-captures",
+        "message": (
+            "This URL has been already captured 1 times today, which is a "
+            "daily limit we have set for that Resource type. Please try again "
+            'tomorrow. Please email us at "info@archive.org" if you would like '
+            "to discuss this more."
+        ),
+    }
+
+    def _submit(self, payload, **kwargs):
+        with patch(
+            "spn_client.client.requests.post", return_value=_mock_response(payload)
+        ):
+            return wayback.submit(
+                "https://example.com/doc.pdf",
+                access_key="AK",
+                secret_key="SK456",
+                **kwargs,
+            )
+
+    def test_a_daily_cap_refusal_is_a_refusal_not_an_acceptance(self):
+        result = self._submit(self.DAILY_CAP)
+
+        assert result["submitted"] is False
+        assert result["job_id"] is None
+        assert result["archived"] is False
+        assert "already captured 1 times today" in result["error"]
+        assert result["error_summary"].startswith("archive.org refused the request: ")
+        assert "already captured 1 times today" in result["error_summary"]
+        # A refusal is not a timeout and not a 429; neither flag applies.
+        assert "outcome_unknown" not in result
+        assert "rate_limited" not in result
+
+    def test_the_code_and_its_category_are_surfaced_like_a_failed_job(self):
+        result = self._submit(self.DAILY_CAP)
+
+        assert result["error_code"] == "error:too-many-daily-captures"
+        assert result["retry_category"] == wayback.categorize_job_error(
+            "error:too-many-daily-captures"
+        )
+
+    def test_a_status_ext_with_no_job_is_a_refusal_even_without_a_status_field(self):
+        """The field names rest on other clients' records, not a capture of
+        ours, so either marker is enough."""
+        result = self._submit(
+            {"status_ext": "error:blocked-url", "message": "This URL is excluded."}
+        )
+
+        assert result["submitted"] is False
+        assert result["error_code"] == "error:blocked-url"
+        assert result["retry_category"] == "permanent"
+
+    def test_an_unrecognized_code_is_none_not_permanent(self):
+        result = self._submit({"status": "error", "status_ext": "error:brand-new-2027"})
+
+        assert result["submitted"] is False
+        assert result["error_code"] == "error:brand-new-2027"
+        assert result["retry_category"] is None
+        # No message, so the code itself is the explanation on offer.
+        assert result["error"] == "error:brand-new-2027"
+
+    def test_an_error_that_names_no_code_or_message_still_says_so(self):
+        result = self._submit({"status": "error"})
+
+        assert result["submitted"] is False
+        assert result["error_code"] is None
+        assert result["retry_category"] is None
+        assert result["error"] == "archive.org reported an unspecified error"
+        assert result["error_summary"] == "archive.org refused the request"
+
+    def test_an_exception_field_is_the_last_resort_explanation(self):
+        result = self._submit({"status": "error", "exception": "worker crashed"})
+
+        assert result["error"] == "worker crashed"
+
+    def test_a_queued_job_is_not_a_refusal(self):
+        result = self._submit({"url": "https://example.com/", "job_id": JOB_ID})
+
+        assert result["submitted"] is True
+        assert result["job_id"] == JOB_ID
+        assert "error" not in result
+        assert "error_code" not in result
+
+    def test_a_pending_status_with_a_job_is_not_a_refusal(self):
+        result = self._submit({"status": "pending", "job_id": JOB_ID})
+
+        assert result["submitted"] is True
+        assert result["job_id"] == JOB_ID
+
+    def test_the_accepted_but_no_capture_body_is_unchanged(self):
+        """The one shape that legitimately is "accepted, nothing started": a
+        ``job_id`` of null and a ``message``, with no ``status`` at all. Measured
+        live 2026-09-06 (see ``_capture_params``); it must keep reading as it
+        did, or this change would be re-labelling a case it has no evidence for."""
+        result = self._submit(
+            {
+                "url": "https://example.com/",
+                "job_id": None,
+                "message": (
+                    "The same snapshot had been made 177 hours, 9 minutes ago. "
+                    "You can make new capture of this URL after 4320 hours."
+                ),
+            }
+        )
+
+        assert result["submitted"] is True
+        assert result["job_id"] is None
+        assert (
+            "accepted the request without starting a capture"
+            in (result["error_summary"])
+        )
+        assert "error_code" not in result
+        assert "retry_category" not in result
+
+    def test_a_refusal_message_is_scrubbed_of_every_secret_the_call_carries(self):
+        """archive.org's message can echo what it was sent. Every path that
+        returns its words redacts the same set as the transport-failure path."""
+        payload = {
+            "status": "error",
+            "status_ext": "error:bad-request",
+            "message": (
+                "bad request for https://example.com/?api_key=KEYVAL "
+                "auth SK456 login PW789 cookie SESSION=abc"
+            ),
+        }
+        result = self._submit(
+            payload, target_password="PW789", capture_cookie="SESSION=abc"
+        )
+
+        for text in (result["error"], result["error_summary"]):
+            for secret in ("KEYVAL", "SK456", "PW789", "SESSION=abc"):
+                assert secret not in text
+            assert "[REDACTED]" in text
+
+
 class TestCheckJobStatus:
     """Reading the outcome of an SPN2 capture."""
 
