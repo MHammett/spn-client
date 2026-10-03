@@ -50,6 +50,9 @@ class CheckResult(TypedDict, total=False):
     snapshot_stale: bool
     snapshot_status: str
     snapshot_is_error_capture: bool
+    found_via: str
+    snapshot_is_revisit: bool
+    cdx_error: str
     error: str
 
 
@@ -134,6 +137,7 @@ class SystemStatusResult(TypedDict):
 
 
 _AVAILABILITY_API = "https://archive.org/wayback/available"
+_CDX_API = "https://web.archive.org/cdx/search/cdx"
 _SAVE_API = "https://web.archive.org/save"
 _SAVE_STATUS_API = "https://web.archive.org/save/status"
 _SAVE_USER_STATUS_API = "https://web.archive.org/save/status/user"
@@ -342,13 +346,23 @@ def _retry_after_seconds(resp: requests.Response | None, attempt: int) -> float:
 def _paced_get(
     endpoint: str,
     timeout: float,
-    params: dict[str, str] | None = None,
+    params: dict[str, str | list[str]] | None = None,
     headers: dict[str, str] | None = None,
+    attempts: int | None = None,
 ) -> requests.Response:
     """GET an archive.org endpoint with pacing, backoff, and a circuit breaker.
 
     Raises the last exception if every attempt fails, so the caller's existing
     error handling is unchanged.
+
+    ``attempts`` (default ``_MAX_ATTEMPTS``) exists for the CDX lookup, the one
+    request here that is slow rather than merely throttled. Measured 2026-09-28,
+    seven exact-URL CDX queries (the ``limit=-1`` and date-range forms): four
+    answered, in 15.6s, 33.4s, 40.7s and 51.7s, and three timed out (30s once,
+    45s twice). Three attempts of that is minutes of wall clock spent waiting on
+    a lookup that only ever backs up a first answer already in hand.
+    A 429 is still noted and still counts toward the breaker with one attempt;
+    what is given up is only the retry.
 
     There is no local sleep between attempts: a 429 pushes the shared clock out
     and the wait then happens in the next ``_pace()``, which every thread goes
@@ -364,7 +378,7 @@ def _paced_get(
     """
     last_exc = None
     rate_limited = False
-    for attempt in range(_MAX_ATTEMPTS):
+    for attempt in range(attempts or _MAX_ATTEMPTS):
         _pace()
         try:
             resp = requests.get(
@@ -396,6 +410,122 @@ def _paced_get(
 def _get_availability(url: str, timeout: float) -> requests.Response:
     """GET the availability API through the shared pacing/backoff/breaker path."""
     return _paced_get(_AVAILABILITY_API, timeout, params={"url": url})
+
+
+#: CDX fields asked for. ``original`` is the URL as archived (it can differ from
+#: the one asked about by scheme or case), ``mimetype`` is what tells a
+#: ``warc/revisit`` record apart from a real capture, and ``digest`` is how a
+#: revisit is tied back to the capture whose content it points at.
+_CDX_FIELDS = "timestamp,original,mimetype,statuscode,digest"
+
+
+def _cdx_captures(
+    url: str, timeout: float, **extra: str | list[str]
+) -> list[dict[str, str]]:
+    """Rows the CDX index holds for ``url``, as dicts. Empty for no captures.
+
+    "No captures" is a ``200`` with the body ``[]`` (observed 2026-09-28 for a
+    ``.invalid`` address), so an empty body and a header-only answer are treated
+    the same way rather than as errors. Raises ``requests`` exceptions and
+    ``ValueError`` (a body that is not JSON); the caller decides what those mean.
+    """
+    params: dict[str, str | list[str]] = {
+        "url": url,
+        "output": "json",
+        "fl": _CDX_FIELDS,
+        **extra,
+    }
+    resp = _paced_get(_CDX_API, timeout, params=params, attempts=1)
+    if not resp.text.strip():
+        return []
+    data = resp.json()
+    if not isinstance(data, list) or len(data) < 2:
+        return []
+    header, *rows = data
+    return [dict(zip(header, row)) for row in rows if isinstance(row, list)]
+
+
+def _apply_cdx_second_opinion(
+    result: CheckResult, url: str, timeout: float, stale_days: int | None
+) -> None:
+    """Fold what CDX knows into an availability answer that may be wrong. See
+    ``check()``'s ``cdx_fallback`` for why, and for the evidence.
+
+    Only ever *promotes*: CDX replaces the availability answer when it holds a
+    newer capture that is a real one, and otherwise leaves it exactly as it was.
+    A failure lands in ``cdx_error`` and changes nothing else, so turning the
+    fallback on cannot make a lookup that used to succeed fail.
+
+    "A real one" is the whole difficulty. A capture with status ``200`` is. A
+    4xx/5xx capture is not, because ``check()``'s answer is "a usable copy
+    exists". A ``warc/revisit`` record (status ``-``) is the case that motivated
+    this: archive.org's dedup records "same bytes as before" as a pointer, and
+    the pointer says nothing about *what* the bytes were. Left unchecked, a page
+    that has answered 404 for a year would be reported freshly archived by its
+    latest revisit. So a revisit is trusted only after a second lookup finds a
+    ``200`` capture carrying the same digest.
+    """
+    if rate_limited_out():
+        result["cdx_error"] = (
+            "skipped: archive.org rate limit tripped earlier this run "
+            "(no CDX lookup attempted)"
+        )
+        return
+    try:
+        rows = _cdx_captures(url, timeout, limit="-1")
+        latest = max(rows, key=lambda r: r.get("timestamp", ""), default=None)
+        ts = latest.get("timestamp", "") if latest else ""
+        # Timestamps are fixed-width digits, so string order is time order. Equal
+        # is "nothing newer": the availability answer was already the latest.
+        if latest is None or not ts or ts <= result.get("snapshot_ts", ""):
+            return
+        status = latest.get("statuscode", "")
+        revisit = latest.get("mimetype") == "warc/revisit" or status == "-"
+        if revisit:
+            digest = latest.get("digest")
+            pointed_at = (
+                _cdx_captures(
+                    url,
+                    timeout,
+                    limit="1",
+                    filter=["statuscode:200", f"digest:{digest}"],
+                )
+                if digest
+                else []
+            )
+            if not pointed_at:
+                return
+            status = pointed_at[0].get("statuscode", "200")
+        elif not status.startswith("2"):
+            return
+    except requests.exceptions.RequestException as exc:
+        err = redact.redact_url_keys(str(exc))
+        log.debug("Wayback CDX lookup failed for %s: %s", url, err)
+        result["cdx_error"] = err
+        return
+    except ValueError as exc:
+        # As in check(): the decoder's own complaint sends a reader hunting for a
+        # parser bug that is really an error page.
+        log.debug("Wayback CDX returned non-JSON for %s: %s", url, exc)
+        result["cdx_error"] = (
+            "archive.org returned a non-JSON response from the CDX API"
+        )
+        return
+
+    # The availability answer's per-snapshot fields describe a snapshot this one
+    # replaces; none of them may survive into the promoted result.
+    result.pop("snapshot_status", None)
+    result.pop("snapshot_is_error_capture", None)
+    original = latest.get("original") or url
+    result.update(
+        _snapshot_state(f"https://web.archive.org/web/{ts}/{original}", ts, stale_days)
+    )
+    result["archived"] = True
+    result["found_via"] = "cdx"
+    result["snapshot_status"] = str(status)
+    result["snapshot_is_error_capture"] = False
+    if revisit:
+        result["snapshot_is_revisit"] = True
 
 
 def _paced_submit(
@@ -536,7 +666,13 @@ def _validate_url(url: Any) -> None:
         raise ValueError(f"url must start with http:// or https://, got {url!r}")
 
 
-def check(url: str, timeout: float = 10, stale_days: int | None = None) -> CheckResult:
+def check(
+    url: str,
+    timeout: float = 10,
+    stale_days: int | None = None,
+    cdx_fallback: bool = False,
+    cdx_timeout: float = 60,
+) -> CheckResult:
     """Check if a URL has a Wayback Machine snapshot and how fresh it is.
 
     If ``url`` is itself a Wayback Machine snapshot link, it is recognized as
@@ -545,6 +681,50 @@ def check(url: str, timeout: float = 10, stale_days: int | None = None) -> Check
     Whether that archive link actually resolves is a separate question this
     function does not answer.
 
+    **The availability API is a convenience wrapper, and its answer can be
+    wrong in three documented or measured ways.** Only the first two are
+    something ``cdx_fallback`` can help with:
+
+    1. *It never returns a revisit record.* When archive.org captures a page
+       whose bytes are unchanged, it stores a ``warc/revisit`` pointer (status
+       ``-`` in CDX) instead of new bytes. The availability API skips those, so
+       a page that has not changed cannot become fresh here however often it is
+       captured. Measured 2026-09-28 for one NHTSA PDF: CDX lists the 2024-08-12
+       capture (``application/pdf``, 200, digest ``DMH3E3XE…``) and a capture
+       from 2026-09-27 20:42:13 UTC (``warc/revisit``, ``-``, the *same* digest,
+       824 bytes) whose exact-timestamp URL answers ``200 application/pdf``,
+       while this function's availability lookup returned only the 2024
+       capture, flagged stale. A caller acting on "stale" re-submits it forever.
+    2. *It can answer empty for URLs that have captures.* Reported 2026-09-24 in
+       cyanheads/internet-archive-mcp-server#27: ``archived_snapshots: {}`` for
+       nasa.gov, www.nasa.gov and wikipedia.org, while CDX listed a capture for
+       nasa.gov. Also internetarchive/wayback#296 (2025-09-23): empty for the
+       ``https://`` form of a URL where the scheme-less form answers. Neither
+       reproduced when measured here on 2026-09-28 (nasa.gov answered
+       normally), so treat them as episodic or URL-specific.
+    3. *It lags fresh captures.* archive.org's help centre says "the Wayback
+       Machine can sometimes experience delays in registering snapshots made
+       using the Save Page Now tool", and that a page may show for "maybe a few
+       hours or days" and then disappear for a while. Seen 2026-09-27: a capture
+       was absent from this lookup 1h42m after it was made and present 5.5h
+       after. CDX does **not** cure this: MKRWW/wortlaut's spec measured its
+       index empty for the capture day right after a capture.
+
+    ``cdx_fallback=True`` asks the CDX index for the newest capture whenever the
+    availability answer is "not archived" or "stale", and uses it if it is newer
+    and real (a ``200``, or a revisit whose digest matches a ``200`` capture).
+    It never demotes an answer, and a failed CDX lookup is reported in
+    ``cdx_error`` without changing the availability result.
+
+    It is off by default because CDX is slow and unreliable, not merely
+    throttled. Measured 2026-09-28: seven queries for URLs that have captures,
+    of which four answered in 15.6s to 51.7s and three timed out; a further one
+    answered ``503 Temporarily Offline`` after 5.9s. So it gets its own
+    ``cdx_timeout``, one attempt (a
+    timeout is not retried), and it is only consulted where the caller would
+    otherwise act on a possibly-wrong "not archived"/"stale", which is exactly
+    when a wrong answer costs a capture request.
+
     Returns a dict with:
       archived        bool | None  — True/False, or None on network error
       is_archive_url  bool         — True when the link itself is a web.archive.org URL
@@ -552,6 +732,12 @@ def check(url: str, timeout: float = 10, stale_days: int | None = None) -> Check
       snapshot_ts     str          — raw Wayback timestamp (YYYYMMDDHHMMSS)
       snapshot_age_days  int       — days since the snapshot was taken
       snapshot_stale  bool         — True when older than the stale threshold
+      found_via       str          — ``"cdx"``, present only when the CDX
+                                     fallback supplied the snapshot
+      snapshot_is_revisit  bool    — present (True) when that snapshot is a
+                                     revisit record of unchanged content
+      cdx_error       str          — the CDX lookup failed or was skipped; the
+                                     other fields are the availability answer
       error           str          — set only on network/parse failure
     """
     _validate_url(url)
@@ -606,24 +792,28 @@ def check(url: str, timeout: float = 10, stale_days: int | None = None) -> Check
 
     closest = data.get("archived_snapshots", {}).get("closest", {})
     if not closest.get("available"):
-        return {"url": url, "archived": False}
-
-    result = {"url": url, "archived": True}
-    # The availability API reports the captured response's own HTTP status, and
-    # it's tempting to discard it. It matters: a snapshot can be a capture of a
-    # 403 block page or a 404, and "a snapshot exists" then means the opposite
-    # of what a caller might assume. A capture made through ``submit()`` here
-    # always sends ``capture_all=0`` so it never makes one, but a *pre-existing*
-    # snapshot is outside this package's control.
-    status = closest.get("status")
-    if status:
-        result["snapshot_status"] = str(status)
-        result["snapshot_is_error_capture"] = not str(status).startswith("2")
-    result.update(
-        _snapshot_state(
-            closest.get("url", ""), closest.get("timestamp", ""), stale_days
+        result = {"url": url, "archived": False}
+    else:
+        result = {"url": url, "archived": True}
+        # The availability API reports the captured response's own HTTP status,
+        # and it's tempting to discard it. It matters: a snapshot can be a
+        # capture of a 403 block page or a 404, and "a snapshot exists" then
+        # means the opposite of what a caller might assume. A capture made
+        # through ``submit()`` here always sends ``capture_all=0`` so it never
+        # makes one, but a *pre-existing* snapshot is outside this package's
+        # control.
+        status = closest.get("status")
+        if status:
+            result["snapshot_status"] = str(status)
+            result["snapshot_is_error_capture"] = not str(status).startswith("2")
+        result.update(
+            _snapshot_state(
+                closest.get("url", ""), closest.get("timestamp", ""), stale_days
+            )
         )
-    )
+
+    if cdx_fallback and (not result["archived"] or result.get("snapshot_stale")):
+        _apply_cdx_second_opinion(result, url, cdx_timeout, stale_days)
     return result
 
 
