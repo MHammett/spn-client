@@ -70,6 +70,8 @@ class SubmitResult(TypedDict, total=False):
     rate_limited: bool
     error: str
     error_summary: str
+    error_code: str | None
+    retry_category: str | None
 
 
 JobState = Literal["success", "pending", "failed", "not_checked", "unknown"]
@@ -787,6 +789,31 @@ def submit(
     carries a ``job_id`` instead of a snapshot. That id is the only handle on
     the outcome, and ``check_job_status`` is the only thing that can read it.
 
+    **A refusal can arrive as a 200.** On the authenticated path archive.org
+    answers a capture request it will not run with HTTP 200 and a JSON body of
+    ``{"status": "error", "status_ext": "error:too-many-daily-captures",
+    "message": "..."}`` and no ``job_id``, so ``raise_for_status()`` passes and a
+    caller that reads only ``job_id`` sees "accepted, nothing started". This
+    function used to do exactly that: ``submitted: True`` with the reason buried
+    in ``error_summary``, which a caller reading ``submitted`` took for success.
+    It now returns ``submitted: False`` with ``error_code`` and
+    ``retry_category``, the fields ``check_job_status`` already gives a failed
+    job.
+
+    The evidence, so nobody has to take it on trust. Observed live 2026-09-27
+    (the message only; the raw body was not captured): an authenticated
+    ``submit()`` for a PDF that had been captured earlier the same day came back
+    "This URL has been already captured 1 times today, which is a daily limit we
+    have set for that Resource type. Please try again tomorrow." The body shape
+    is as three unrelated clients record it: jordibrouwer/nextdash
+    (``internal/app/health_archive_save.go``, measured live 2026-08-25: a sixth
+    capture of one page in a day answered 200 with that ``status_ext``),
+    meedan/pender (``media_archive_org_archiver.rb``, which branches on it when
+    the response has no ``job_id``) and MKRWW/wortlaut (a spec: "errors come
+    with HTTP 200, already at the capture request"). Because the field names
+    rest on those and not on a capture of our own, a refusal is recognised by
+    either marker: ``status`` of ``"error"``, or a ``status_ext`` with no job.
+
     Either way this does not block waiting for a capture — callers decide who
     waits, how long, and why (see ``check_job_status``).
 
@@ -808,6 +835,19 @@ def submit(
                                      capture anyway, so this must not be
                                      reported as a failed submission.
       error             str        — set only on failure
+      error_summary     str        — the sentence a caller is safe to surface.
+                                     Set on every failure, and also when
+                                     archive.org accepted the request but
+                                     started no capture
+      error_code        str | None — the raw SPN2 ``status_ext`` code. Set only
+                                     when archive.org *refused* the request (see
+                                     "A refusal can arrive as a 200" above);
+                                     ``None`` if it named no reason
+      retry_category    str | None — ``categorize_job_error(error_code)``, set
+                                     alongside it: the same field
+                                     ``check_job_status`` reports for a failed
+                                     job. ``None`` for a code the table does not
+                                     recognize, which is not "permanent"
 
     Optional capture options (authenticated path only — the anonymous
     endpoint takes no form fields, so these are silently unused without
@@ -859,6 +899,22 @@ def submit(
         if authenticated
         else _ANONYMOUS_SUBMIT_INTERVAL_SECONDS
     )
+
+    def _scrub(text: object) -> str:
+        """Text about to be returned, with every secret this call carries
+        removed. One definition, because the two places that return archive.org's
+        words (a transport failure's exception text, a refusal's message) had to
+        agree about which secrets, and a list copied into each is how a newly
+        added parameter gets redacted in one and forgotten in the other — 0.3.0's
+        ``capture_cookie`` was exactly that."""
+        return redact.redact_value(
+            redact.redact_value(
+                redact.redact_value(redact.redact_url_keys(text), secret_key),
+                target_password,
+            ),
+            capture_cookie,
+        )
+
     try:
         if authenticated:
             headers["Authorization"] = f"LOW {access_key}:{secret_key}"
@@ -902,6 +958,37 @@ def submit(
                 )
             resp.raise_for_status()
             payload = resp.json()
+            status_ext = payload.get("status_ext") or None
+            if payload.get("status") == "error" or (
+                status_ext and not payload.get("job_id")
+            ):
+                # A refusal, and archive.org sent it as a 200 — see "A refusal
+                # can arrive as a 200" in this function's docstring for why
+                # nothing above caught it and what the evidence is. Same field
+                # order as check_job_status's failed branch: the most human
+                # explanation present, then the raw code and its category.
+                detail = _scrub(
+                    str(
+                        payload.get("message")
+                        or status_ext
+                        or payload.get("exception")
+                        or ""
+                    ).strip()
+                )
+                return {
+                    "url": url,
+                    "submitted": False,
+                    "job_id": None,
+                    "archived": False,
+                    "error": detail or "archive.org reported an unspecified error",
+                    "error_summary": (
+                        f"archive.org refused the request: {detail}"
+                        if detail
+                        else "archive.org refused the request"
+                    ),
+                    "error_code": status_ext,
+                    "retry_category": categorize_job_error(status_ext),
+                }
             result: SubmitResult = {
                 "url": url,
                 "submitted": True,
@@ -949,13 +1036,7 @@ def submit(
             result.update(_snapshot_state(resp.url, m.group(1), stale_days))
         return result
     except requests.exceptions.RequestException as exc:
-        err = redact.redact_value(
-            redact.redact_value(
-                redact.redact_value(redact.redact_url_keys(str(exc)), secret_key),
-                target_password,
-            ),
-            capture_cookie,
-        )
+        err = _scrub(str(exc))
         # A read timeout is not a refusal. The request reached archive.org and
         # we gave up waiting for the answer; the capture may have run to
         # completion regardless. Observed live 2026-09-05 — a 30s read timeout
@@ -1403,9 +1484,14 @@ def system_status(
 #:                        A batch loop should stop treating this URL as
 #:                        pending and move on, not keep re-queuing it.
 #:   "transient"        — archive.org's own infrastructure had a bad moment;
-#:                        the same URL is worth trying again later.
+#:                        the same URL is worth trying again later. Also a
+#:                        ceiling that belongs to *this URL alone* and resets
+#:                        (``error:too-many-daily-captures``): "later" then
+#:                        means after the reset, and the rest of the run is
+#:                        unaffected.
 #:   "quota_exhausted"  — a real ceiling was hit (daily/bandwidth/session
-#:                        limit). Retrying *this* URL sooner does nothing;
+#:                        limit) on the account, the IP or the target host.
+#:                        Retrying *this* URL sooner does nothing;
 #:                        the whole run should back off, not just this item.
 #:
 #: Heuristic, not a guarantee — archive.org's docs give a one-line gloss per
@@ -1452,7 +1538,29 @@ _JOB_ERROR_CATEGORIES = {
     "error:read-timeout": "transient",
     "error:soft-time-limit-exceeded": "transient",
     "error:service-unavailable": "transient",
-    "error:too-many-daily-captures": "quota_exhausted",
+    # A cap on ONE URL, not on the run, so not "quota_exhausted", which tells a
+    # caller to stop submitting everything. It was filed there on the strength
+    # of its name. Its own description in SPN2's docs is "This URL has been
+    # captured 10 times today. We cannot make any more captures." (as copied
+    # into ramazansancar/spn2's README and tweaselORG/TrackHAR's wayback.ts),
+    # and the live refusal says the same about the URL, not the account: "This
+    # URL has been already captured 1 times today, which is a daily limit we
+    # have set for that Resource type" (observed 2026-09-27). The number is not
+    # fixed: 1 in that message, 5 in nextdash's measurement ("a sixth capture of
+    # the same page in one day"), 10 in SPN2's docs, and the message ties it to
+    # the URL's "Resource type".
+    #
+    # The evidence that other URLs are unaffected: in that 2026-09-27 batch, one
+    # URL was refused for this reason while a second, submitted in the same
+    # batch, was not refused and came back with a snapshot. Under
+    # "quota_exhausted" a caller following the README would have stopped
+    # submitting after the first.
+    #
+    # "transient" is the reaction a caller needs: try this URL again, but not
+    # until archive.org's daily reset. Retrying sooner is refused again, at the
+    # cost of one paced request. ``error_code`` still names the cause for a
+    # caller that wants to schedule the retry for tomorrow.
+    "error:too-many-daily-captures": "transient",
     "error:too-many-redirects": "permanent",
     "error:too-many-requests": "quota_exhausted",
     "error:user-session-limit": "quota_exhausted",

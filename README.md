@@ -20,7 +20,7 @@ against archive.org at any volume:
   documented capture-endpoint limits (7/min authenticated, 3/min anonymous)
   — not just the availability check.
 - **Categorized capture failures.** archive.org's SPN2 API documents ~30
-  specific error codes; `check_job_status()` sorts each into `"permanent"`
+  specific error codes; `check_job_status()` (and a refused `submit()`) sorts each into `"permanent"`
   (retrying won't help), `"transient"` (worth trying again), or
   `"quota_exhausted"` (back off the whole run, not just this URL) via
   `categorize_job_error()`.
@@ -84,7 +84,10 @@ else:
     # submitted: False — archive.org refused, or the request itself
     # failed/timed out. error_summary is safe to show a user; outcome_unknown
     # distinguishes an ambiguous timeout (the capture may have gone through
-    # anyway — recheck later) from a real refusal.
+    # anyway — recheck later) from a real refusal. A refusal that names a
+    # reason also carries error_code and retry_category, as in step 3 —
+    # e.g. "error:too-many-daily-captures" once a URL has hit its per-day
+    # capture cap.
     ...
 ```
 

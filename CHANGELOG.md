@@ -12,6 +12,41 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
 
 ## [Unreleased]
 
+### Fixed
+- `submit()` now reports a refusal as a refusal. archive.org answers a
+  capture request it will not run — most visibly a URL that has hit its
+  per-day capture cap — with HTTP 200 and a JSON body of
+  `{"status": "error", "status_ext": ..., "message": ...}` and no `job_id`.
+  `submit()` read only `job_id` and `message`, so it returned
+  `submitted: True` with the reason buried in `error_summary` ("accepted the
+  request without starting a capture"), which a caller reading `submitted`
+  took for success. It now returns `submitted: False` and surfaces
+  `error_code` (the raw `status_ext`) and `retry_category`, the same fields
+  `check_job_status()` already gives a failed job.
+  **Behavior change:** `submitted` is `False` for these responses where it
+  used to be `True`. The one body that is still "accepted, nothing started" —
+  a null `job_id` and a `message` with no `status`, which is what
+  `if_not_archived_within` produced when measured 2026-09-06 — is unchanged.
+  Evidence for the body's shape is in `submit()`'s docstring: the message was
+  observed live 2026-09-27, the field names are as three unrelated clients
+  record them, and a refusal is recognised by either marker because we have
+  not captured the raw body ourselves.
+- A refusal's message is now redacted of `secret_key`, `target_password`,
+  `capture_cookie` and URL-embedded keys before it is returned, by the same
+  helper the transport-failure path uses, so the two cannot drift apart.
+
+### Changed
+- `error:too-many-daily-captures` is now categorized `"transient"`, not
+  `"quota_exhausted"`. It is a cap on one URL (SPN2's own wording: "This URL
+  has been captured 10 times today"), not on the account, so
+  `"quota_exhausted"` — which tells a caller to stop submitting everything —
+  was halting runs that had nothing else wrong with them. `error_code` still
+  names the cause for a caller that wants to retry that URL tomorrow. The
+  evidence is in the comment on its `_JOB_ERROR_CATEGORIES` entry.
+  **Behavior change** for any caller that branched on `"quota_exhausted"` to
+  stop a run: this code no longer reaches that branch. Kept as its own commit
+  so it can be dropped without touching the `submit()` fix above.
+
 ## [0.3.1] — 2026-09-13
 
 A senior-engineer audit pass: security, reliability, and packaging hardening,
