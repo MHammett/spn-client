@@ -26,7 +26,7 @@ from spn_client.client import (
     system_status,
 )
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "ARCHIVE_ARCHIVED",

@@ -12,6 +12,13 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-10-03
+
+Reads what archive.org's answers actually say: a capture request it refuses with
+HTTP 200 is now reported as a refusal, and `check(cdx_fallback=True)` finds the
+revisit captures the availability API never lists. Two entries below change
+behavior for existing callers and are marked **Behavior change**.
+
 ### Added
 - `check(cdx_fallback=True, cdx_timeout=60)`: when the availability API says a
   URL is "not archived" or "stale", ask the CDX index for the newest capture
@@ -166,6 +173,7 @@ async job-status polling, and an explicit archive-outcome vocabulary
 that distinguishes "we asked archive.org" from "archive.org confirmed it
 archived this."
 
+[0.4.0]: https://github.com/MHammett/spn-client/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/MHammett/spn-client/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/MHammett/spn-client/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/MHammett/spn-client/compare/v0.2.0...v0.2.1
