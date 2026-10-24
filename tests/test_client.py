@@ -744,6 +744,75 @@ class TestRateLimitGuard:
         assert wayback.rate_limited_out() is False
 
 
+class TestCheckReportsRateLimited:
+    """``check()`` carries the same ``rate_limited`` flag ``submit()`` does, so
+    a caller need not match the ``error`` text to tell a refusal from a fault.
+
+    Each test drives the real ``check()`` through ``_paced_get``; only
+    ``requests.get`` and the sleeps are patched. The state is process-wide, so
+    it is reset on both sides of every test.
+    """
+
+    URL = "https://example.com/page"
+
+    def setup_method(self):
+        wayback.reset_rate_limit_state()
+
+    def teardown_method(self):
+        wayback.reset_rate_limit_state()
+
+    def _check(self, **get_kwargs):
+        with (
+            patch("spn_client.client.requests.get", **get_kwargs) as mock_get,
+            patch.object(wayback.time, "sleep"),
+            patch.object(wayback, "_MIN_INTERVAL_SECONDS", 0.0),
+            patch.object(wayback, "_BACKOFF_BASE_SECONDS", 0.0),
+        ):
+            return wayback.check(self.URL), mock_get
+
+    def test_a_lookup_refused_on_every_attempt_is_flagged(self):
+        result, mock_get = self._check(return_value=_rate_limited_response())
+
+        assert mock_get.call_count == wayback._MAX_ATTEMPTS
+        assert result["archived"] is None
+        assert result["rate_limited"] is True
+        assert "429" in result["error"]
+
+    def test_a_tripped_breaker_is_flagged_without_a_lookup(self):
+        wayback._rate_limited_lookups = wayback._CIRCUIT_TRIP_AFTER
+
+        result, mock_get = self._check(return_value=_ok_response())
+
+        mock_get.assert_not_called()
+        assert result["archived"] is None
+        assert result["error"].startswith("skipped: archive.org rate limit tripped")
+        assert result["rate_limited"] is True
+
+    @pytest.mark.parametrize(
+        "get_kwargs",
+        [
+            lambda: {"side_effect": requests.exceptions.ReadTimeout("slow")},
+            lambda: {"side_effect": requests.exceptions.ConnectionError("down")},
+            lambda: {"return_value": _error_response(503)},
+        ],
+        ids=["timeout", "connection-error", "http-503"],
+    )
+    def test_other_failures_never_carry_the_flag(self, get_kwargs):
+        result, _ = self._check(**get_kwargs())
+
+        assert result["archived"] is None
+        assert "error" in result
+        assert "rate_limited" not in result
+
+    def test_a_good_answer_does_not_carry_the_flag(self):
+        answer = _mock_response({"archived_snapshots": {}})
+        answer.status_code = 200
+
+        result, _ = self._check(return_value=answer)
+
+        assert result == {"url": self.URL, "archived": False}
+
+
 class TestNonJsonAvailabilityResponse:
     def setup_method(self):
         wayback.reset_rate_limit_state()

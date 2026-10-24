@@ -53,6 +53,7 @@ class CheckResult(TypedDict, total=False):
     found_via: str
     snapshot_is_revisit: bool
     cdx_error: str
+    rate_limited: bool
     error: str
 
 
@@ -739,6 +740,14 @@ def check(
       cdx_error       str          — the CDX lookup failed or was skipped; the
                                      other fields are the availability answer
       error           str          — set only on network/parse failure
+      rate_limited    bool         : present (True) only alongside ``error``,
+                                     when archive.org's limit is why there is
+                                     no answer: the breaker had already tripped
+                                     and no lookup was made, or this lookup
+                                     was refused with a 429 on every attempt.
+                                     The same key, with the same meaning, as
+                                     on :func:`submit`. A timeout or any other
+                                     failure never carries it
     """
     _validate_url(url)
     # The link is already a Wayback snapshot — read its date from the URL itself.
@@ -758,6 +767,7 @@ def check(
                 "skipped: archive.org rate limit tripped earlier this run "
                 "(no snapshot lookup attempted)"
             ),
+            "rate_limited": True,
         }
     try:
         resp = _get_availability(url, timeout)
@@ -769,7 +779,13 @@ def check(
         # error and any log/report built on it.
         err = redact.redact_url_keys(str(exc))
         log.debug("Wayback availability check failed for %s: %s", url, err)
-        return {"url": url, "archived": None, "error": err}
+        failed: CheckResult = {"url": url, "archived": None, "error": err}
+        # Only the HTTPError ``_paced_get`` raises after a 429 on every attempt
+        # carries a 429 response; a timeout or connection error has none, and
+        # says nothing about the limit. Same test ``submit()`` applies.
+        if getattr(getattr(exc, "response", None), "status_code", None) == 429:
+            failed["rate_limited"] = True
+        return failed
 
     try:
         data = resp.json()
