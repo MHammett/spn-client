@@ -12,6 +12,16 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
 
 ## [Unreleased]
 
+### Added
+- `check()` now sets `rate_limited: True` on a result that archive.org's limit
+  refused, as `submit()` already did. Two paths carry it: the breaker had
+  already tripped and no lookup was made (`skipped: archive.org rate limit
+  tripped earlier this run ...`), and a lookup that got a 429 on every attempt.
+  Both still return `archived: None` and the same `error` text as before. A
+  timeout, a connection error or any other HTTP error never carries the key,
+  and a normal answer does not either. Additive: the key is new on
+  `CheckResult`, so a caller that matches the `error` text keeps working.
+
 ## [0.4.0] — 2026-10-03
 
 Reads what archive.org's answers actually say: a capture request it refuses with
