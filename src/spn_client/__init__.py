@@ -9,6 +9,7 @@ from spn_client.client import (
     ARCHIVE_SUBMIT_FAILED,
     ARCHIVE_SUBMITTED,
     DEFAULT_STALE_DAYS,
+    SHARED_STATE_ENV,
     CaptureCapacityResult,
     CheckResult,
     JobStatusResult,
@@ -24,6 +25,7 @@ from spn_client.client import (
     snapshot_raw_url,
     submit,
     system_status,
+    use_shared_state,
 )
 
 __version__ = "0.4.0"
@@ -37,6 +39,7 @@ __all__ = [
     "ARCHIVE_SUBMITTED",
     "ARCHIVE_SUBMIT_FAILED",
     "DEFAULT_STALE_DAYS",
+    "SHARED_STATE_ENV",
     "CaptureCapacityResult",
     "CheckResult",
     "JobStatusResult",
@@ -52,4 +55,5 @@ __all__ = [
     "snapshot_raw_url",
     "submit",
     "system_status",
+    "use_shared_state",
 ]
