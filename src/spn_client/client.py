@@ -18,7 +18,9 @@ plus the upstream issues this project has filed/commented on):
 """
 
 import logging
+import os
 import re
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
@@ -28,6 +30,7 @@ import requests
 
 from spn_client import _redact as redact
 from spn_client._http import DEFAULT_HEADERS
+from spn_client._shared_state import SharedState
 
 log = logging.getLogger(__name__)
 
@@ -268,6 +271,97 @@ _blocked_until = 0.0
 _rate_limited_lookups = 0
 
 
+#: Machine-wide state, see ``use_shared_state``. ``None`` until configured.
+_shared: SharedState | None = None
+
+#: Whether ``SPN_CLIENT_SHARED_STATE`` has been read. Read on first use rather
+#: than at import, so a caller that sets it after importing still gets it.
+_shared_configured = False
+
+#: The environment variable that turns on machine-wide state for every process
+#: that reads it, without code changes in each caller.
+SHARED_STATE_ENV = "SPN_CLIENT_SHARED_STATE"
+
+#: How long the machine-wide breaker stays open once tripped, before one
+#: request is let through to see whether the throttle has ended. The same five
+#: minutes content-intelligence waits before reopening its per-process breaker
+#: (its #445), because archive.org's throttle is episodic: all 429s for a
+#: while, then all 200s (2026-08-12 and 08-15 above).
+_SHARED_BREAKER_COOLDOWN_SECONDS = 300.0
+
+#: Refusals older than this no longer count toward tripping the machine-wide
+#: breaker. The per-process count never decays because a process is one run;
+#: the shared file outlives every run, so without a window five refusals
+#: spread over a week would trip it. Half an hour is about one review run.
+_SHARED_REFUSAL_WINDOW_SECONDS = 1800.0
+
+
+def use_shared_state(path: str | os.PathLike[str] | None) -> None:
+    """Share pacing, backoff and the circuit breaker with every process on
+    this machine that names the same ``path``. ``None`` turns it off.
+
+    Without it each process paces itself, so three at once ask archive.org
+    three times as often, and each collects its own refusals before stopping.
+    With it they take turns on one clock, a 429 backs all of them off, and the
+    breaker trips after ``_CIRCUIT_TRIP_AFTER`` refusals among all of them.
+    Setting ``SPN_CLIENT_SHARED_STATE`` to a path does the same for every
+    process that has not called this.
+
+    The machine-wide breaker closes on its own: after
+    ``_SHARED_BREAKER_COOLDOWN_SECONDS`` one request goes out, and a success
+    closes it while a refusal opens it again. ``reset_rate_limit_state`` does
+    not touch it: a run starting must not reopen what another run tripped.
+
+    A file that cannot be opened is logged and ignored, leaving this process
+    on its own state as before.
+    """
+    global _shared, _shared_configured
+    _shared_configured = True
+    if path is None:
+        _shared = None
+        return
+    try:
+        _shared = SharedState(path)
+    except (sqlite3.Error, OSError) as exc:
+        log.warning(
+            "archive.org rate-limit state %s could not be opened (%s); "
+            "pacing this process on its own",
+            path,
+            exc,
+        )
+        _shared = None
+
+
+def _shared_state() -> SharedState | None:
+    if not _shared_configured:
+        use_shared_state(os.environ.get(SHARED_STATE_ENV) or None)
+    return _shared
+
+
+def _shared_call(method: str, *args: Any) -> Any:
+    """Call ``method`` on the shared state, or do nothing without one.
+
+    A file that fails mid-run (deleted, disk full, locked past the timeout)
+    switches this process back to its own state rather than failing the call
+    it was pacing: the request is still worth making, only less politely.
+    """
+    global _shared
+    shared = _shared_state()
+    if shared is None:
+        return None
+    try:
+        return getattr(shared, method)(*args)
+    except (sqlite3.Error, OSError) as exc:
+        log.warning(
+            "archive.org rate-limit state %s failed (%s); pacing this process "
+            "on its own from now on",
+            shared.path,
+            exc,
+        )
+        _shared = None
+        return None
+
+
 def reset_rate_limit_state() -> None:
     """Clear the pacing clock, the backoff, and the circuit breaker.
 
@@ -275,6 +369,9 @@ def reset_rate_limit_state() -> None:
     a reset a breaker tripped by one run would skip every archive.org call in
     the next run inside the same process — a silently degraded run whose
     submissions all report "skipped" for a limit that expired long ago.
+
+    Only this process's state: the machine-wide state of ``use_shared_state``
+    is left alone, because another process's run may be what tripped it.
     """
     global _last_call_at, _blocked_until, _rate_limited_lookups
     with _pace_lock:
@@ -284,9 +381,12 @@ def reset_rate_limit_state() -> None:
 
 
 def rate_limited_out() -> bool:
-    """True once the circuit breaker has tripped for this run."""
+    """True once the circuit breaker has tripped for this run, or while the
+    machine-wide breaker (``use_shared_state``) is open."""
     with _pace_lock:
-        return _rate_limited_lookups >= _CIRCUIT_TRIP_AFTER
+        if _rate_limited_lookups >= _CIRCUIT_TRIP_AFTER:
+            return True
+    return bool(_shared_call("is_open"))
 
 
 def _pace(min_interval: float | None = None) -> None:
@@ -316,6 +416,12 @@ def _pace(min_interval: float | None = None) -> None:
         target = max(_last_call_at + min_interval, _blocked_until)
         if target > now:
             time.sleep(target - now)
+        # Then a slot on the machine-wide clock, if there is one. Reserved
+        # after the local wait, so the slot is claimed when this thread is
+        # really ready; the other threads of this process queue on the lock.
+        shared_wait = _shared_call("reserve", min_interval)
+        if shared_wait:
+            time.sleep(shared_wait)
         _last_call_at = time.monotonic()
 
 
@@ -324,6 +430,7 @@ def _note_rate_limited(retry_after: float) -> None:
     global _blocked_until
     with _pace_lock:
         _blocked_until = max(_blocked_until, time.monotonic() + retry_after)
+    _shared_call("note_rate_limited", retry_after)
 
 
 def _note_lookup_refused() -> None:
@@ -331,6 +438,17 @@ def _note_lookup_refused() -> None:
     global _rate_limited_lookups
     with _pace_lock:
         _rate_limited_lookups += 1
+    _shared_call(
+        "note_refused",
+        _CIRCUIT_TRIP_AFTER,
+        _SHARED_REFUSAL_WINDOW_SECONDS,
+        _SHARED_BREAKER_COOLDOWN_SECONDS,
+    )
+
+
+def _note_answered() -> None:
+    """archive.org answered without a 429: closes a half-open shared breaker."""
+    _shared_call("note_success")
 
 
 def _retry_after_seconds(resp: requests.Response | None, attempt: int) -> float:
@@ -399,6 +517,7 @@ def _paced_get(
             )
             _note_rate_limited(_retry_after_seconds(resp, attempt))
             continue
+        _note_answered()
         resp.raise_for_status()
         return resp
     # One refused lookup, however many attempts it took to establish that.
@@ -563,6 +682,7 @@ def _paced_submit(
             )
             _note_rate_limited(_retry_after_seconds(resp, attempt))
             continue
+        _note_answered()
         return resp
     _note_lookup_refused()
     assert last_exc is not None, "loop always sets last_exc before falling through"

@@ -13,6 +13,15 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
 ## [Unreleased]
 
 ### Added
+- `use_shared_state(path)`, and the `SPN_CLIENT_SHARED_STATE` environment
+  variable, share pacing, backoff and the circuit breaker among every process
+  on a machine that names the same SQLite file. Without it each process keeps
+  its own clock, so N processes on one IP ask archive.org N times as often.
+  The shared breaker trips on five refusals among all processes within 30
+  minutes and closes on its own: after 5 minutes one request is let through,
+  and a success closes it. Off unless configured; per-process behaviour is
+  unchanged, and `reset_rate_limit_state()` still resets only the process.
+  Standard library only (`sqlite3`).
 - `check()` now sets `rate_limited: True` on a result that archive.org's limit
   refused, as `submit()` already did. Two paths carry it: the breaker had
   already tripped and no lookup was made (`skipped: archive.org rate limit

@@ -8,6 +8,8 @@ against archive.org at any volume:
   per IP, not per thread or per endpoint. A naive per-thread backoff (or none
   at all) looks fine in testing and then silently stops archiving anything
   the first time it's run concurrently or against a busy queue.
+  Optionally machine-wide (`use_shared_state`), for several processes on
+  one IP.
 - **Both submission modes.** Anonymous `GET /save/<url>` (capture runs inline,
   answer comes back as a redirect) and S3-key-authenticated `POST /save`
   (capture is queued, answer comes back as a `job_id` you poll for).
@@ -150,6 +152,32 @@ independent run/process if you're running this as a long-lived worker —
 the pacing/breaker state is process-wide and intentionally does not reset
 itself, so a breaker tripped by one run would otherwise silently degrade
 the next.
+
+### Several processes on one machine
+
+The pacing and breaker above are per process, but archive.org throttles per
+IP: three processes at once each pace at 3 seconds, so archive.org sees a
+request a second, and each collects its own refusals before it stops. To make
+them take turns, point every process at one file:
+
+```python
+spn_client.use_shared_state("/path/to/spn_state.sqlite")
+```
+
+or set `SPN_CLIENT_SHARED_STATE=/path/to/spn_state.sqlite` in the environment
+of every process (nothing else to change in the callers). It is off unless
+one of those is set. With it:
+
+- requests from every process share one clock, at the usual 3 seconds apart;
+- a 429 backs off every process, not just the one that got it;
+- the breaker trips after five refusals among all of them in half an hour,
+  and stops every process. It closes on its own: after five minutes one
+  request goes out, a success closes it and a refusal opens it again.
+  `reset_rate_limit_state()` does not reopen it, because another process's
+  run may be what tripped it.
+
+The file is plain SQLite, safe to delete between runs. If it cannot be opened
+or fails mid-run, the process logs a warning and goes back to pacing itself.
 
 ### Optional capture options
 
