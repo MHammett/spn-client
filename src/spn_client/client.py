@@ -308,8 +308,8 @@ def use_shared_state(path: str | os.PathLike[str] | None) -> None:
     process that has not called this.
 
     The machine-wide breaker closes on its own: after
-    ``_SHARED_BREAKER_COOLDOWN_SECONDS`` one request goes out, and a success
-    closes it while a refusal opens it again. ``reset_rate_limit_state`` does
+    ``_SHARED_BREAKER_COOLDOWN_SECONDS`` requests resume at the usual pace, and
+    a success closes it while a refusal opens it again at once. ``reset_rate_limit_state`` does
     not touch it: a run starting must not reopen what another run tripped.
 
     A file that cannot be opened is logged and ignored, leaving this process

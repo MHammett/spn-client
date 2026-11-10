@@ -171,8 +171,9 @@ one of those is set. With it:
 - requests from every process share one clock, at the usual 3 seconds apart;
 - a 429 backs off every process, not just the one that got it;
 - the breaker trips after five refusals among all of them in half an hour,
-  and stops every process. It closes on its own: after five minutes one
-  request goes out, a success closes it and a refusal opens it again.
+  and stops every process. It closes on its own: after five minutes
+  requests resume at the usual pace, a success closes it and a refusal opens
+  it again at once.
   `reset_rate_limit_state()` does not reopen it, because another process's
   run may be what tripped it.
 

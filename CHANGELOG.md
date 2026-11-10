@@ -18,8 +18,8 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
   on a machine that names the same SQLite file. Without it each process keeps
   its own clock, so N processes on one IP ask archive.org N times as often.
   The shared breaker trips on five refusals among all processes within 30
-  minutes and closes on its own: after 5 minutes one request is let through,
-  and a success closes it. Off unless configured; per-process behaviour is
+  minutes and closes on its own: after 5 minutes requests resume at the
+  usual pace, a success closes it and a refusal reopens it at once. Off unless configured; per-process behaviour is
   unchanged, and `reset_rate_limit_state()` still resets only the process.
   Standard library only (`sqlite3`).
 - `check()` now sets `rate_limited: True` on a result that archive.org's limit
