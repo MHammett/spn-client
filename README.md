@@ -213,9 +213,11 @@ raw_url = spn_client.snapshot_raw_url(status["snapshot_url"])
 
 This library is built to stay inside archive.org's limits, not to get around them.
 
-- It sends one fixed User-Agent, `spn-client/<version>`. There is no User-Agent
-  rotation, proxy support, or any other way to change how it identifies itself
-  or where it connects from.
+- It identifies itself with one fixed User-Agent, `spn-client/<version>`, plus
+  standard `Accept` and `Accept-Language` headers. The library has no User-Agent
+  rotation or spoofing, and no proxy or IP options of its own. (As with any
+  `requests`-based tool, proxy environment variables such as `HTTPS_PROXY` are
+  still honoured if you set them.)
 - Calls share one process-wide clock, at least 3 seconds apart. Capture requests
   are held to archive.org's documented SPN2 limits: 3 per minute anonymous,
   7 per minute with your own S3 keys.
