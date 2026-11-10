@@ -209,6 +209,28 @@ gives you the unmodified capture instead:
 raw_url = spn_client.snapshot_raw_url(status["snapshot_url"])
 ```
 
+## Responsible use
+
+This library is built to stay inside archive.org's limits, not to get around them.
+
+- It sends one fixed User-Agent, `spn-client/<version>`. There is no User-Agent
+  rotation, proxy support, or any other way to change how it identifies itself
+  or where it connects from.
+- Calls share one process-wide clock, at least 3 seconds apart. Capture requests
+  are held to archive.org's documented SPN2 limits: 3 per minute anonymous,
+  7 per minute with your own S3 keys.
+- A 429 is honoured: it reads `Retry-After`, backs off, and slows every thread,
+  not just the one that was refused. After 5 refused lookups a circuit breaker
+  stops further calls for the rest of the run.
+- Authenticated mode uses your own archive.org account keys, which is archive.org's
+  own higher-limit tier. The library does not share, pool, or fabricate accounts.
+
+`use_user_agent` is the SPN2 API's own option for what the capture bot tells the
+*target site*. It does not change what this client tells archive.org.
+
+Don't use this to push more load at archive.org than it allows. If you hit a
+limit, the right response is to wait.
+
 ## What this doesn't do
 
 This is the archive.org client only — it has no opinion about:
