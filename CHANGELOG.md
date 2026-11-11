@@ -30,6 +30,11 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
   and timeouts are not counted. The machine-wide breaker still counts 429s only.
 
 ### Added
+- `pace()` and `paced_get(url, timeout, params=None, headers=None)`: a caller's
+  own archive.org requests (a snapshot read, say) can sit on the same shared
+  clock, breaker and backoff as `check()` and `submit()`, so they count against
+  the same per-IP budget instead of adding to it unpaced. Callers should check
+  `rate_limited_out()` first.
 - `use_shared_state(path)`, and the `SPN_CLIENT_SHARED_STATE` environment
   variable, share pacing, backoff and the circuit breaker among every process
   on a machine that names the same SQLite file. Without it each process keeps

@@ -616,6 +616,35 @@ def _paced_get(
     raise last_exc
 
 
+def pace(min_interval: float | None = None) -> None:
+    """Wait on the shared archive.org clock before a request of the caller's own.
+
+    For a consumer that fetches archive.org itself, such as a snapshot read
+    outside ``check()``. It sits on the same process-wide clock (and, with
+    ``use_shared_state``, the machine-wide one) as this module's own calls, so
+    its requests count against the same per-IP budget. A 429 or refused
+    connection the caller sees should be reported with ``paced_get()``, which
+    feeds the breaker. Callers should check ``rate_limited_out()`` first.
+    """
+    _pace(min_interval)
+
+
+def paced_get(
+    url: str,
+    timeout: float,
+    params: dict[str, str | list[str]] | None = None,
+    headers: dict[str, str] | None = None,
+) -> requests.Response:
+    """GET any archive.org URL through the shared pacing, backoff and breaker.
+
+    The same path ``check()`` uses: waits on the shared clock, retries with
+    backoff on a 429 or a refused connection, and counts toward the breaker.
+    Raises as ``check()``'s own requests do: ``HTTPError`` for a non-2xx answer,
+    the request exception for a transport failure. Callers handle those.
+    """
+    return _paced_get(url, timeout, params=params, headers=headers)
+
+
 def _get_availability(url: str, timeout: float) -> requests.Response:
     """GET the availability API through the shared pacing/backoff/breaker path."""
     return _paced_get(_AVAILABILITY_API, timeout, params={"url": url})
