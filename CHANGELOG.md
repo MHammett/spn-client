@@ -12,6 +12,13 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-11
+
+One machine, one polite client: pacing, backoff and the breaker can be shared
+by every process on a machine, a refused connection is treated as archive.org
+closing the address, and a caller's own archive.org requests can sit on the
+same clock. **Behavior change:** a refused connection is no longer retried.
+
 ### Changed
 - A refused TCP connection to archive.org (WinError 10061, `ECONNREFUSED`) now
   backs every caller off for 60 seconds (`_REFUSED_BACKOFF_SECONDS`), through
@@ -34,14 +41,6 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
   one.
 - A dropped connection or a timeout is still never retried, and still reported
   as `outcome_unknown` where that applies.
-
-### Release
-- The next release should include #8 (cross-process state), #10 (the refused
-  backoff) and #12 (the refused-call breaker, `pace()`/`paced_get()`) together.
-  content-intelligence pins `spn-client>=0.4.0,<0.5`, so it needs a pin bump
-  after the release, plus three call-site changes to route its own archive.org
-  reads through `paced_get()`: `resolver.py` `_verify_one`, the archive fallback
-  in the same file, and `analysis/links.py`.
 
 ### Added
 - `note_outcome(status_code=None, exc=None, retry_after=None)`: the other half
@@ -240,6 +239,7 @@ async job-status polling, and an explicit archive-outcome vocabulary
 that distinguishes "we asked archive.org" from "archive.org confirmed it
 archived this."
 
+[0.5.0]: https://github.com/MHammett/spn-client/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MHammett/spn-client/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/MHammett/spn-client/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/MHammett/spn-client/compare/v0.2.1...v0.3.0
