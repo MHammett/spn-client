@@ -24,8 +24,10 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
   the one transport failure that is safe to retry: no request was sent, so no
   capture can have started. A dropped connection or a timeout is still never
   retried, and still reported as `outcome_unknown` where that applies.
-  Refused connections do not count toward the circuit breaker, which counts
-  429s.
+  A refused connection now counts toward a run's refusal breaker: a call
+  (lookup or submission) whose every attempt was refused counts once, and the
+  run stops submitting after `_REFUSED_TRIP_AFTER` (3) such calls. DNS failures
+  and timeouts are not counted. The machine-wide breaker still counts 429s only.
 
 ### Added
 - `use_shared_state(path)`, and the `SPN_CLIENT_SHARED_STATE` environment

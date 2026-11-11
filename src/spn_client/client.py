@@ -253,6 +253,20 @@ _AUTHENTICATED_SUBMIT_INTERVAL_SECONDS = 60.0 / 7  # 7/min
 #: attempts made this trip after two lookups rather than five.)
 _CIRCUIT_TRIP_AFTER = 5
 
+#: Refused *connections* tolerated in a run before we stop asking. Counted once
+#: per call (lookup or submission) whose every attempt was refused by TCP, not
+#: once per attempt, so the ``_MAX_ATTEMPTS`` tries inside one call are a single
+#: refusal. Kept on a counter of its own: a 429 says archive.org is pacing us,
+#: a refused connect says it has stopped accepting this address for a while,
+#: and the run should stop sooner in the second case. DNS failures and timeouts
+#: are not counted; they are not refusals.
+#:
+#: Reverses an earlier rule that refused connections never counted. Measured
+#: 2026-11-11: five consecutive ``/save`` submissions 8.5 s apart all landed
+#: inside one refusal window, each waiting out its backoff and then failing,
+#: with nothing to stop the run.
+_REFUSED_TRIP_AFTER = 3
+
 #: Queue depth at which archive.org counts as busy rather than merely up.
 #: Measured healthy 2026-09-06 with every one of its thirteen capture queues
 #: at zero, so any sustained backlog is worth telling the caller about — it
@@ -269,6 +283,9 @@ _blocked_until = 0.0
 #: Lookups this run that exhausted every attempt against a 429. Never reset on
 #: success — see the note above on why "consecutive" cannot work here.
 _rate_limited_lookups = 0
+
+#: Calls this run whose every attempt was refused at TCP. See ``_REFUSED_TRIP_AFTER``.
+_refused_calls = 0
 
 
 #: Machine-wide state, see ``use_shared_state``. ``None`` until configured.
@@ -373,11 +390,12 @@ def reset_rate_limit_state() -> None:
     Only this process's state: the machine-wide state of ``use_shared_state``
     is left alone, because another process's run may be what tripped it.
     """
-    global _last_call_at, _blocked_until, _rate_limited_lookups
+    global _last_call_at, _blocked_until, _rate_limited_lookups, _refused_calls
     with _pace_lock:
         _last_call_at = 0.0
         _blocked_until = 0.0
         _rate_limited_lookups = 0
+        _refused_calls = 0
 
 
 def rate_limited_out() -> bool:
@@ -385,6 +403,8 @@ def rate_limited_out() -> bool:
     machine-wide breaker (``use_shared_state``) is open."""
     with _pace_lock:
         if _rate_limited_lookups >= _CIRCUIT_TRIP_AFTER:
+            return True
+        if _refused_calls >= _REFUSED_TRIP_AFTER:
             return True
     return bool(_shared_call("is_open"))
 
@@ -491,6 +511,18 @@ def _note_lookup_refused() -> None:
     )
 
 
+def _note_refused_call() -> None:
+    """Count one call (lookup or submission) whose every attempt was refused at TCP.
+
+    Per-process, like the 429 count it sits beside. The machine-wide breaker
+    still counts 429s only; a refused connect is already shared through the
+    clock in ``_note_rate_limited``.
+    """
+    global _refused_calls
+    with _pace_lock:
+        _refused_calls += 1
+
+
 def _note_answered() -> None:
     """archive.org answered without a 429: closes a half-open shared breaker."""
     _shared_call("note_success")
@@ -542,6 +574,7 @@ def _paced_get(
     """
     last_exc = None
     rate_limited = False
+    all_refused = True
     for attempt in range(attempts or _MAX_ATTEMPTS):
         _pace()
         try:
@@ -557,9 +590,12 @@ def _paced_get(
                 # Not a 429, so not a refused lookup for the breaker: a refused
                 # connection says nothing about this URL, only about the address.
                 _note_rate_limited(_REFUSED_BACKOFF_SECONDS)
+            else:
+                all_refused = False
             continue
         if resp.status_code == 429:
             rate_limited = True
+            all_refused = False
             last_exc = requests.HTTPError(
                 f"429 Client Error: Too Many Requests for url: {resp.url}",
                 response=resp,
@@ -572,6 +608,10 @@ def _paced_get(
     # One refused lookup, however many attempts it took to establish that.
     if rate_limited:
         _note_lookup_refused()
+    elif all_refused:
+        # Every attempt was refused at TCP: one refused call toward the run's
+        # refusal breaker. A DNS failure or timeout clears all_refused above.
+        _note_refused_call()
     assert last_exc is not None, "loop always sets last_exc before falling through"
     raise last_exc
 
@@ -721,10 +761,12 @@ def _paced_submit(
     confirms nothing was created, so backing off and trying again is safe.
     So is a refused connect (``_connect_refused``): the request was never
     sent. It backs every caller off ``_REFUSED_BACKOFF_SECONDS`` and is tried
-    again. It is not counted toward the breaker, which counts 429s.
+    again. A call whose every attempt was refused counts once toward the run's
+    refusal breaker (``_REFUSED_TRIP_AFTER``); the shared 429 breaker is unchanged.
     """
     last_exc: Exception | None = None
     rate_limited = False
+    all_refused = True
     for attempt in range(_MAX_ATTEMPTS):
         _pace(min_interval)
         try:
@@ -740,6 +782,7 @@ def _paced_submit(
             continue
         if resp.status_code == 429:
             rate_limited = True
+            all_refused = False
             last_exc = requests.HTTPError(
                 f"429 Client Error: Too Many Requests for url: {resp.url}",
                 response=resp,
@@ -748,9 +791,12 @@ def _paced_submit(
             continue
         _note_answered()
         return resp
-    # Only a 429 is a refusal the breaker counts; refused connections are not.
+    # Only a 429 is a refusal the shared breaker counts. Every attempt refused
+    # at TCP is one refused call toward the run's own refusal breaker.
     if rate_limited:
         _note_lookup_refused()
+    elif all_refused:
+        _note_refused_call()
     assert last_exc is not None, "loop always sets last_exc before falling through"
     raise last_exc
 
