@@ -20,14 +20,47 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
   every connection from one address for about two minutes at a time, with no
   429 first, while the availability API kept answering. Lookups used to retry
   such a refusal at once, inside the window.
-- `submit()` now retries a refused connect, up to `_MAX_ATTEMPTS` times. It is
-  the one transport failure that is safe to retry: no request was sent, so no
-  capture can have started. A dropped connection or a timeout is still never
-  retried, and still reported as `outcome_unknown` where that applies.
-  Refused connections do not count toward the circuit breaker, which counts
-  429s.
+- A refused connection is no longer retried, in either `check()` or `submit()`.
+  It ends its call at once and counts toward the breaker: each refused call
+  counts once toward a run's refusal breaker, which stops the run after
+  `_REFUSED_TRIP_AFTER` (3) such calls. It also counts toward the machine-wide
+  breaker (`use_shared_state`) with a one-hour cooldown
+  (`_REFUSED_COOLDOWN_SECONDS`), so a second process does not walk into the same
+  block. Retrying a refused connect was argued safe for a capture (no request
+  was sent), but a refusal is archive.org closing the address, and each retry
+  is another knock at the firewall. The one-hour figure comes from third-party
+  reports, not archive.org. DNS failures and timeouts are not counted. The 429
+  breaker is unchanged; a refused trip extends an open 429 trip, never shortens
+  one.
+- A dropped connection or a timeout is still never retried, and still reported
+  as `outcome_unknown` where that applies.
+
+### Release
+- The next release should include #8 (cross-process state), #10 (the refused
+  backoff) and #12 (the refused-call breaker, `pace()`/`paced_get()`) together.
+  content-intelligence pins `spn-client>=0.4.0,<0.5`, so it needs a pin bump
+  after the release, plus three call-site changes to route its own archive.org
+  reads through `paced_get()`: `resolver.py` `_verify_one`, the archive fallback
+  in the same file, and `analysis/links.py`.
 
 ### Added
+- `note_outcome(status_code=None, exc=None, retry_after=None)`: the other half
+  of `pace()`, for a caller whose archive.org fetch must go through its own
+  code (an SSRF guard, a page cache). It reports what archive.org answered, so
+  that request's 429 or refused connection backs everyone off and counts
+  toward the breaker like any other.
+- `breaker_reason()`: why `rate_limited_out()` is true: `"rate_limited"`,
+  `"connection_refused"` or `"machine_wide"`. A caller that reopens the breaker
+  after a cooldown should not do so for `"connection_refused"`.
+- `default_shared_state_path()`: one per-user file (`%LOCALAPPDATA%` on
+  Windows, the XDG cache elsewhere) for `use_shared_state`, so separate
+  projects on one machine share one clock without agreeing on a path. Shared
+  state stays opt-in.
+- `pace()` and `paced_get(url, timeout, params=None, headers=None)`: a caller's
+  own archive.org requests (a snapshot read, say) can sit on the same shared
+  clock, breaker and backoff as `check()` and `submit()`, so they count against
+  the same per-IP budget instead of adding to it unpaced. Callers should check
+  `rate_limited_out()` first.
 - `use_shared_state(path)`, and the `SPN_CLIENT_SHARED_STATE` environment
   variable, share pacing, backoff and the circuit breaker among every process
   on a machine that names the same SQLite file. Without it each process keeps

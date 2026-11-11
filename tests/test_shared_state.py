@@ -308,3 +308,29 @@ class TestTurningItOn:
         (count,) = conn.execute("SELECT count(*) FROM refusals").fetchone()
         conn.close()
         assert count == 1
+
+    def test_refused_calls_trip_the_machine_wide_breaker_for_an_hour(self, state_file):
+        # A second process must not walk into the same firewall block: refused
+        # calls reach the shared breaker, on the long refused cooldown.
+        import time
+
+        client.use_shared_state(state_file)
+        refused = requests_exc_refused()
+        with (
+            patch("spn_client.client.requests.get", side_effect=refused),
+            patch.object(client.time, "sleep"),
+        ):
+            for i in range(client._REFUSED_TRIP_AFTER):
+                client.submit(f"https://example.com/{i}")
+        conn = _shared_state.sqlite3.connect(str(state_file))
+        (open_until,) = conn.execute("SELECT open_until FROM clock").fetchone()
+        conn.close()
+        assert client._shared.is_open() is True
+        assert open_until - time.time() > client._REFUSED_COOLDOWN_SECONDS - 60
+
+
+def requests_exc_refused():
+    """A refused TCP connect as requests raises it."""
+    import requests
+
+    return requests.exceptions.ConnectionError(ConnectionRefusedError(10061, "refused"))
