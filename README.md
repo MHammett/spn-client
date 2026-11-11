@@ -184,7 +184,7 @@ The file is plain SQLite, safe to delete between runs. If it cannot be opened
 or fails mid-run, the process logs a warning and goes back to pacing itself.
 
 `spn_client.default_shared_state_path()` returns one per-user file
-(`%LOCALAPPDATA%\spn-clientate-limit.sqlite` on Windows, the XDG cache
+(`%LOCALAPPDATA%\spn-client\rate-limit.sqlite` on Windows, the XDG cache
 elsewhere), so separate projects share a clock without agreeing on a path:
 
 ```python
