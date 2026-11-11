@@ -287,6 +287,24 @@ _rate_limited_lookups = 0
 #: Calls this run whose every attempt was refused at TCP. See ``_REFUSED_TRIP_AFTER``.
 _refused_calls = 0
 
+#: Requests this run sent to archive.org, by endpoint. See ``request_counts``.
+_request_counts: dict[str, int] = {}
+
+#: Longest prefix first: the user- and system-status URLs sit under the
+#: job-status one, which sits under the capture one.
+_ENDPOINT_LABELS = (
+    (_SAVE_SYSTEM_STATUS_API, "system_status"),
+    (_SAVE_USER_STATUS_API, "user_status"),
+    (_SAVE_STATUS_API, "job_status"),
+    (_SAVE_API, "save"),
+    (_CDX_API, "cdx"),
+    (_AVAILABILITY_API, "availability"),
+)
+
+#: The label for a request to anything else: a snapshot read, or whatever a
+#: caller paces with ``pace()`` and fetches itself.
+_CALLER_ENDPOINT = "caller"
+
 
 #: Machine-wide state, see ``use_shared_state``. ``None`` until configured.
 _shared: SharedState | None = None
@@ -396,6 +414,7 @@ def reset_rate_limit_state() -> None:
         _blocked_until = 0.0
         _rate_limited_lookups = 0
         _refused_calls = 0
+        _request_counts.clear()
 
 
 def rate_limited_out() -> bool:
@@ -496,6 +515,45 @@ def _connect_refused(exc: BaseException) -> bool:
             if e is not None
         )
     return False
+
+
+def _endpoint_label(url: str) -> str:
+    for prefix, label in _ENDPOINT_LABELS:
+        if url == prefix or url.startswith((prefix + "/", prefix + "?")):
+            return label
+    return _CALLER_ENDPOINT
+
+
+def _count_request(endpoint: str) -> None:
+    """Count one request about to be sent. Every attempt is one: a 429 and a
+    refused connection are requests archive.org received."""
+    with _pace_lock:
+        _request_counts[endpoint] = _request_counts.get(endpoint, 0) + 1
+    _shared_call("count_request", endpoint)
+
+
+def request_counts(
+    machine_wide: bool = False, day: str | None = None
+) -> dict[str, int]:
+    """How many requests went to archive.org, by endpoint.
+
+    Keys are ``availability``, ``cdx``, ``save``, ``job_status``,
+    ``user_status``, ``system_status`` and ``caller`` (anything else: a
+    snapshot read through ``paced_get()``, or a request the caller paced with
+    ``pace()``). An endpoint nothing was sent to is absent. Each attempt is
+    counted, so a lookup that drew three 429s is three. A call the breaker
+    skipped sent nothing and counts nothing.
+
+    By default, this process since ``reset_rate_limit_state()``: one run.
+    ``machine_wide=True`` reads the shared file instead (``use_shared_state``):
+    every process on the machine, for ``day`` (``YYYY-MM-DD``, UTC; today by
+    default). That is the number archive.org sees from this address, which no
+    single run can know. ``{}`` when shared state is off.
+    """
+    if machine_wide:
+        return dict(_shared_call("request_counts", day) or {})
+    with _pace_lock:
+        return dict(_request_counts)
 
 
 def _note_rate_limited(retry_after: float) -> None:
@@ -605,8 +663,10 @@ def _paced_get(
     """
     last_exc = None
     rate_limited = False
+    endpoint_label = _endpoint_label(endpoint)
     for attempt in range(attempts or _MAX_ATTEMPTS):
         _pace()
+        _count_request(endpoint_label)
         try:
             resp = requests.get(
                 endpoint,
@@ -650,8 +710,12 @@ def pace(min_interval: float | None = None) -> None:
     its requests count against the same per-IP budget. A 429 or refused
     connection the caller sees should be reported with ``paced_get()``, which
     feeds the breaker. Callers should check ``rate_limited_out()`` first.
+
+    Counted as one ``caller`` request in ``request_counts()``: call it once
+    per request actually sent.
     """
     _pace(min_interval)
+    _count_request(_CALLER_ENDPOINT)
 
 
 def paced_get(
@@ -899,6 +963,7 @@ def _paced_submit(
     rate_limited = False
     for attempt in range(_MAX_ATTEMPTS):
         _pace(min_interval)
+        _count_request(_endpoint_label(endpoint))
         try:
             resp = getattr(requests, method)(endpoint, timeout=timeout, **kwargs)
         except requests.exceptions.ConnectionError as exc:
