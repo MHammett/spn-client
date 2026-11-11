@@ -151,7 +151,10 @@ class SharedState:
                 "SELECT count(*) FROM refusals WHERE at > ?",
                 (max(now - window, closed_at),),
             ).fetchone()
-            if count >= trip_after and open_until <= now:
+            # Extend an open breaker to a longer cooldown, never shorten one: a
+            # refused trip (one hour) lengthens a 429 trip (five minutes) that is
+            # already open, and a 429 trip cannot shorten a refused one.
+            if count >= trip_after and open_until < now + cooldown:
                 conn.execute(
                     "UPDATE clock SET open_until = ?, half_open = 1 WHERE id = 1",
                     (now + cooldown,),

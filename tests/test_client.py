@@ -1051,19 +1051,18 @@ class TestRefusedConnectionsCountTowardABreaker:
                 wayback.check(f"https://example.com/{i}")
         assert wayback.rate_limited_out() is False
 
-    def test_a_refusal_then_an_answer_is_not_a_refused_call(self):
+    def test_a_refused_lookup_is_not_retried(self):
         ok = MagicMock(status_code=200, headers={}, url="https://example.com/")
         ok.raise_for_status.return_value = None
         with (
             patch.object(wayback.time, "sleep"),
             patch(
-                "spn_client.client.requests.get",
-                side_effect=[_refused_connect(), ok] * wayback._REFUSED_TRIP_AFTER,
-            ),
+                "spn_client.client.requests.get", side_effect=[_refused_connect(), ok]
+            ) as get,
+            pytest.raises(requests.exceptions.ConnectionError),
         ):
-            for _ in range(wayback._REFUSED_TRIP_AFTER):
-                wayback._paced_get(wayback._AVAILABILITY_API, 5, params={"url": "x"})
-        assert wayback.rate_limited_out() is False
+            wayback._paced_get(wayback._AVAILABILITY_API, 5, params={"url": "x"})
+        assert get.call_count == 1
 
     @pytest.mark.parametrize(
         "exc",
@@ -2193,7 +2192,9 @@ class TestARefusedConnectionBacksOff:
     def test_other_failures_are_not_a_refused_connect(self, exc):
         assert wayback._connect_refused(exc) is False
 
-    def test_a_capture_is_retried_after_a_back_off_and_can_then_succeed(self):
+    def test_a_refused_capture_is_not_retried_and_backs_everyone_off(self):
+        # Politeness, not duplicate risk: a refusal is a firewall-level signal to
+        # stop, so a refused submit is never sent again inside the same call.
         ok = MagicMock(
             status_code=302,
             url="https://web.archive.org/web/20261110000000/https://example.com/",
@@ -2208,12 +2209,11 @@ class TestARefusedConnectionBacksOff:
             ) as get,
         ):
             result = wayback.submit("https://example.com/")
-        assert get.call_count == 2
+        assert get.call_count == 1
         assert backoffs == [wayback._REFUSED_BACKOFF_SECONDS]
-        assert result["submitted"] is True
-        assert result["archived"] is True
+        assert result["submitted"] is False
 
-    def test_a_capture_refused_every_time_fails_after_max_attempts(self):
+    def test_a_refused_capture_fails_at_once(self):
         with (
             patch.object(wayback.time, "sleep"),
             patch(
@@ -2221,7 +2221,7 @@ class TestARefusedConnectionBacksOff:
             ) as get,
         ):
             result = wayback.submit("https://example.com/")
-        assert get.call_count == wayback._MAX_ATTEMPTS
+        assert get.call_count == 1
         assert result["submitted"] is False
         assert "outcome_unknown" not in result
         assert result["error_summary"].startswith("could not reach archive.org")
@@ -2252,4 +2252,6 @@ class TestARefusedConnectionBacksOff:
             patch("spn_client.client.requests.get", side_effect=_refused_connect()),
         ):
             wayback.check("https://example.com/")
+            # The next caller, from any thread, waits out the refusal backoff.
+            wayback._pace()
         assert any(s >= wayback._REFUSED_BACKOFF_SECONDS - 1 for s in slept), slept

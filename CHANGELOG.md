@@ -20,14 +20,28 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
   every connection from one address for about two minutes at a time, with no
   429 first, while the availability API kept answering. Lookups used to retry
   such a refusal at once, inside the window.
-- `submit()` now retries a refused connect, up to `_MAX_ATTEMPTS` times. It is
-  the one transport failure that is safe to retry: no request was sent, so no
-  capture can have started. A dropped connection or a timeout is still never
-  retried, and still reported as `outcome_unknown` where that applies.
-  A refused connection now counts toward a run's refusal breaker: a call
-  (lookup or submission) whose every attempt was refused counts once, and the
-  run stops submitting after `_REFUSED_TRIP_AFTER` (3) such calls. DNS failures
-  and timeouts are not counted. The machine-wide breaker still counts 429s only.
+- A refused connection is no longer retried, in either `check()` or `submit()`.
+  It ends its call at once and counts toward the breaker: each refused call
+  counts once toward a run's refusal breaker, which stops the run after
+  `_REFUSED_TRIP_AFTER` (3) such calls. It also counts toward the machine-wide
+  breaker (`use_shared_state`) with a one-hour cooldown
+  (`_REFUSED_COOLDOWN_SECONDS`), so a second process does not walk into the same
+  block. Retrying a refused connect was argued safe for a capture (no request
+  was sent), but a refusal is archive.org closing the address, and each retry
+  is another knock at the firewall. The one-hour figure comes from third-party
+  reports, not archive.org. DNS failures and timeouts are not counted. The 429
+  breaker is unchanged; a refused trip extends an open 429 trip, never shortens
+  one.
+- A dropped connection or a timeout is still never retried, and still reported
+  as `outcome_unknown` where that applies.
+
+### Release
+- The next release should include #8 (cross-process state), #10 (the refused
+  backoff) and #12 (the refused-call breaker, `pace()`/`paced_get()`) together.
+  content-intelligence pins `spn-client>=0.4.0,<0.5`, so it needs a pin bump
+  after the release, plus three call-site changes to route its own archive.org
+  reads through `paced_get()`: `resolver.py` `_verify_one`, the archive fallback
+  in the same file, and `analysis/links.py`.
 
 ### Added
 - `pace()` and `paced_get(url, timeout, params=None, headers=None)`: a caller's
