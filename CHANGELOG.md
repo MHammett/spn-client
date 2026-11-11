@@ -12,6 +12,21 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
 
 ## [Unreleased]
 
+### Changed
+- A refused TCP connection to archive.org (WinError 10061, `ECONNREFUSED`) now
+  backs every caller off for 60 seconds (`_REFUSED_BACKOFF_SECONDS`), through
+  the same clock a 429 pushes, and across processes when shared state is on.
+  archive.org also throttles this way: on 2026-11-10 web.archive.org refused
+  every connection from one address for about two minutes at a time, with no
+  429 first, while the availability API kept answering. Lookups used to retry
+  such a refusal at once, inside the window.
+- `submit()` now retries a refused connect, up to `_MAX_ATTEMPTS` times. It is
+  the one transport failure that is safe to retry: no request was sent, so no
+  capture can have started. A dropped connection or a timeout is still never
+  retried, and still reported as `outcome_unknown` where that applies.
+  Refused connections do not count toward the circuit breaker, which counts
+  429s.
+
 ### Added
 - `use_shared_state(path)`, and the `SPN_CLIENT_SHARED_STATE` environment
   variable, share pacing, backoff and the circuit breaker among every process
