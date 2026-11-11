@@ -2058,3 +2058,116 @@ class TestJobErrorCategorization:
 
     def test_no_code_at_all_is_none(self):
         assert wayback.categorize_job_error(None) is None
+
+
+def _refused_connect():
+    """The exception ``requests`` raises for a refused TCP connect, layer for layer.
+
+    The shape of the WinError 10061 seen against web.archive.org on 2026-11-10:
+    ``ConnectionError`` -> ``MaxRetryError`` -> ``NewConnectionError`` ->
+    ``ConnectionRefusedError``.
+    """
+    import urllib3
+
+    inner = ConnectionRefusedError(
+        10061,
+        "No connection could be made because the target machine actively refused it",
+    )
+    nce = urllib3.exceptions.NewConnectionError(
+        None, "Failed to establish a new connection: [WinError 10061]"
+    )
+    nce.__cause__ = inner
+    mre = urllib3.exceptions.MaxRetryError(None, "/save", reason=nce)
+    return requests.exceptions.ConnectionError(mre)
+
+
+class TestARefusedConnectionBacksOff:
+    """archive.org also throttles by refusing TCP connections, with no 429 first."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_clock(self):
+        # A refused connect pushes the module's clock 60s out. Left behind, it
+        # makes the next test that does not patch sleep wait it out for real.
+        wayback.reset_rate_limit_state()
+        yield
+        wayback.reset_rate_limit_state()
+
+    def test_the_real_exception_from_a_closed_port_is_recognised(self):
+        import socket
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        with pytest.raises(requests.exceptions.ConnectionError) as info:
+            requests.get(f"http://127.0.0.1:{port}/", timeout=5)
+        assert wayback._connect_refused(info.value) is True
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            requests.exceptions.ConnectionError("connection reset by peer"),
+            requests.exceptions.ReadTimeout("read timed out"),
+            ValueError("not a transport failure at all"),
+        ],
+    )
+    def test_other_failures_are_not_a_refused_connect(self, exc):
+        assert wayback._connect_refused(exc) is False
+
+    def test_a_capture_is_retried_after_a_back_off_and_can_then_succeed(self):
+        ok = MagicMock(
+            status_code=302,
+            url="https://web.archive.org/web/20261110000000/https://example.com/",
+        )
+        ok.raise_for_status.return_value = None
+        backoffs = []
+        with (
+            patch.object(wayback.time, "sleep"),
+            patch.object(wayback, "_note_rate_limited", side_effect=backoffs.append),
+            patch(
+                "spn_client.client.requests.get", side_effect=[_refused_connect(), ok]
+            ) as get,
+        ):
+            result = wayback.submit("https://example.com/")
+        assert get.call_count == 2
+        assert backoffs == [wayback._REFUSED_BACKOFF_SECONDS]
+        assert result["submitted"] is True
+        assert result["archived"] is True
+
+    def test_a_capture_refused_every_time_fails_after_max_attempts(self):
+        with (
+            patch.object(wayback.time, "sleep"),
+            patch(
+                "spn_client.client.requests.get", side_effect=_refused_connect()
+            ) as get,
+        ):
+            result = wayback.submit("https://example.com/")
+        assert get.call_count == wayback._MAX_ATTEMPTS
+        assert result["submitted"] is False
+        assert "outcome_unknown" not in result
+        assert result["error_summary"].startswith("could not reach archive.org")
+
+    def test_a_dropped_capture_is_still_never_retried(self):
+        with patch(
+            "spn_client.client.requests.get",
+            side_effect=requests.exceptions.ConnectionError("connection reset by peer"),
+        ) as get:
+            wayback.submit("https://example.com/")
+        assert get.call_count == 1
+
+    def test_refused_connections_never_trip_the_breaker(self):
+        with (
+            patch.object(wayback.time, "sleep"),
+            patch("spn_client.client.requests.get", side_effect=_refused_connect()),
+        ):
+            for i in range(wayback._CIRCUIT_TRIP_AFTER + 1):
+                wayback.submit(f"https://example.com/{i}")
+        assert wayback.rate_limited_out() is False
+
+    def test_a_refused_lookup_backs_every_caller_off(self):
+        slept = []
+        with (
+            patch.object(wayback.time, "sleep", side_effect=slept.append),
+            patch("spn_client.client.requests.get", side_effect=_refused_connect()),
+        ):
+            wayback.check("https://example.com/")
+        assert any(s >= wayback._REFUSED_BACKOFF_SECONDS - 1 for s in slept), slept

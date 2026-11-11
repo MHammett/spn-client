@@ -425,8 +425,53 @@ def _pace(min_interval: float | None = None) -> None:
         _last_call_at = time.monotonic()
 
 
+#: How long every caller backs off after archive.org refuses a connection.
+#:
+#: archive.org also throttles below HTTP: web.archive.org stops accepting TCP
+#: connections from an address for a while, with no 429 first. Measured in
+#: content-intelligence on 2026-11-10, in three archive passes from one machine:
+#: windows of 1m52s (CDX lookups) and 2m09s (job status and /save), during which
+#: archive.org's availability API on the same address kept answering 200, and
+#: shorter ones on the later passes. Before this, a refused connection was
+#: retried at once by ``_paced_get`` and not at all by ``_paced_submit``, so a
+#: pass kept knocking through the whole window and its submissions in it simply
+#: failed. Sixty seconds, with ``_MAX_ATTEMPTS`` tries, waits out a two-minute
+#: window. It goes through ``_note_rate_limited``, so every thread and, with
+#: shared state, every process waits it out together.
+_REFUSED_BACKOFF_SECONDS = 60.0
+
+
+def _connect_refused(exc: BaseException) -> bool:
+    """True when the request never reached archive.org: its TCP connect was refused.
+
+    That is the one transport failure that is safe to retry for a capture: no
+    byte of the request was sent, so no capture can have started. A dropped
+    connection or a read timeout is not that, and stays unretried in
+    ``_paced_submit``. ``requests`` wraps the refusal several layers deep
+    (``ConnectionError`` -> ``MaxRetryError`` -> ``NewConnectionError`` ->
+    ``ConnectionRefusedError``), so the chain is walked through ``args``,
+    ``reason``, ``__cause__`` and ``__context__``.
+    """
+    seen: set[int] = set()
+    stack: list[Any] = [exc]
+    while stack:
+        cur = stack.pop()
+        if not isinstance(cur, BaseException) or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if isinstance(cur, ConnectionRefusedError):
+            return True
+        stack.extend(a for a in cur.args if isinstance(a, BaseException))
+        stack.extend(
+            e
+            for e in (getattr(cur, "reason", None), cur.__cause__, cur.__context__)
+            if e is not None
+        )
+    return False
+
+
 def _note_rate_limited(retry_after: float) -> None:
-    """Back every thread off after a 429, not just the one that hit it."""
+    """Back every thread off after a 429 or a refused connection, not just the one that hit it."""
     global _blocked_until
     with _pace_lock:
         _blocked_until = max(_blocked_until, time.monotonic() + retry_after)
@@ -508,6 +553,10 @@ def _paced_get(
             )
         except requests.exceptions.RequestException as exc:
             last_exc = exc
+            if _connect_refused(exc):
+                # Not a 429, so not a refused lookup for the breaker: a refused
+                # connection says nothing about this URL, only about the address.
+                _note_rate_limited(_REFUSED_BACKOFF_SECONDS)
             continue
         if resp.status_code == 429:
             rate_limited = True
@@ -670,12 +719,27 @@ def _paced_submit(
     ``submit()``'s own ``outcome_unknown`` field exists to describe rather
     than paper over. A 429 is different: archive.org's own response
     confirms nothing was created, so backing off and trying again is safe.
+    So is a refused connect (``_connect_refused``): the request was never
+    sent. It backs every caller off ``_REFUSED_BACKOFF_SECONDS`` and is tried
+    again. It is not counted toward the breaker, which counts 429s.
     """
-    last_exc = None
+    last_exc: Exception | None = None
+    rate_limited = False
     for attempt in range(_MAX_ATTEMPTS):
         _pace(min_interval)
-        resp = getattr(requests, method)(endpoint, timeout=timeout, **kwargs)
+        try:
+            resp = getattr(requests, method)(endpoint, timeout=timeout, **kwargs)
+        except requests.exceptions.ConnectionError as exc:
+            # A refused connect is the exception to "never retry a transport
+            # failure": nothing was sent, so nothing can be duplicated. Every
+            # other failure propagates, as before.
+            if not _connect_refused(exc):
+                raise
+            last_exc = exc
+            _note_rate_limited(_REFUSED_BACKOFF_SECONDS)
+            continue
         if resp.status_code == 429:
+            rate_limited = True
             last_exc = requests.HTTPError(
                 f"429 Client Error: Too Many Requests for url: {resp.url}",
                 response=resp,
@@ -684,7 +748,9 @@ def _paced_submit(
             continue
         _note_answered()
         return resp
-    _note_lookup_refused()
+    # Only a 429 is a refusal the breaker counts; refused connections are not.
+    if rate_limited:
+        _note_lookup_refused()
     assert last_exc is not None, "loop always sets last_exc before falling through"
     raise last_exc
 
