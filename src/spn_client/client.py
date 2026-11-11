@@ -663,11 +663,87 @@ def paced_get(
     """GET any archive.org URL through the shared pacing, backoff and breaker.
 
     The same path ``check()`` uses: waits on the shared clock, retries with
-    backoff on a 429 or a refused connection, and counts toward the breaker.
+    backoff on a 429, ends at once on a refused connection, and counts both
+    toward the breaker.
     Raises as ``check()``'s own requests do: ``HTTPError`` for a non-2xx answer,
     the request exception for a transport failure. Callers handle those.
     """
     return _paced_get(url, timeout, params=params, headers=headers)
+
+
+def note_outcome(
+    status_code: int | None = None,
+    exc: BaseException | None = None,
+    retry_after: float | None = None,
+) -> None:
+    """Say what archive.org answered to a request the caller made itself.
+
+    The other half of ``pace()``, for a caller that cannot use ``paced_get()``
+    because its fetch has to go through something of its own (an SSRF guard,
+    a page cache). Without this such a request is paced but invisible: its 429
+    slows nobody down and its refused connection trips nothing.
+
+    * ``status_code=429`` backs every caller off (``retry_after`` seconds, the
+      response's ``Retry-After`` if the caller has it) and counts as one
+      refused lookup. The caller made one attempt, so one 429 is one refusal.
+    * ``exc`` that is a refused TCP connect does what a refused connect does
+      anywhere else here (``_note_connection_refused``).
+    * Any other status is an answer and closes a half-open shared breaker.
+    * Any other exception (timeout, DNS, a dropped connection) says nothing
+      about archive.org's willingness and is ignored.
+    """
+    if exc is not None:
+        if _connect_refused(exc):
+            _note_connection_refused()
+        return
+    if status_code == 429:
+        _note_rate_limited(
+            _BACKOFF_BASE_SECONDS if retry_after is None else retry_after
+        )
+        _note_lookup_refused()
+    elif status_code is not None:
+        _note_answered()
+
+
+def breaker_reason() -> str | None:
+    """Why ``rate_limited_out()`` is true, or ``None`` when it is not.
+
+    ``"connection_refused"`` (this run's refused connects), ``"rate_limited"``
+    (this run's 429s) or ``"machine_wide"`` (the shared breaker is open: some
+    process on this machine tripped it). A caller that reopens the breaker
+    after a cooldown with ``reset_rate_limit_state()`` should not do so for
+    ``"connection_refused"``: that is the signal to stay away for a long time.
+    """
+    with _pace_lock:
+        if _refused_calls >= _REFUSED_TRIP_AFTER:
+            return "connection_refused"
+        if _rate_limited_lookups >= _CIRCUIT_TRIP_AFTER:
+            return "rate_limited"
+    return "machine_wide" if _shared_call("is_open") else None
+
+
+def default_shared_state_path() -> str:
+    """The per-user file every project on this machine can agree on.
+
+    ``use_shared_state`` only makes a machine polite if every process names
+    the same file, and two projects choosing their own paths share nothing.
+    ``use_shared_state(default_shared_state_path())`` is the one-line opt-in.
+    Nothing is created by asking; ``use_shared_state`` creates the directory.
+
+    ``%LOCALAPPDATA%`` on Windows, ``$XDG_CACHE_HOME`` or ``~/.cache``
+    elsewhere (macOS included: one rule is easier to find than a third
+    location). platformdirs does this properly; it is one path, and this
+    package's only dependency is ``requests``, so it is not worth a second.
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(
+            os.path.expanduser("~"), "AppData", "Local"
+        )
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+            os.path.expanduser("~"), ".cache"
+        )
+    return os.path.join(base, "spn-client", "rate-limit.sqlite")
 
 
 def _get_availability(url: str, timeout: float) -> requests.Response:

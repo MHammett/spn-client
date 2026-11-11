@@ -44,6 +44,18 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
   in the same file, and `analysis/links.py`.
 
 ### Added
+- `note_outcome(status_code=None, exc=None, retry_after=None)`: the other half
+  of `pace()`, for a caller whose archive.org fetch must go through its own
+  code (an SSRF guard, a page cache). It reports what archive.org answered, so
+  that request's 429 or refused connection backs everyone off and counts
+  toward the breaker like any other.
+- `breaker_reason()`: why `rate_limited_out()` is true: `"rate_limited"`,
+  `"connection_refused"` or `"machine_wide"`. A caller that reopens the breaker
+  after a cooldown should not do so for `"connection_refused"`.
+- `default_shared_state_path()`: one per-user file (`%LOCALAPPDATA%` on
+  Windows, the XDG cache elsewhere) for `use_shared_state`, so separate
+  projects on one machine share one clock without agreeing on a path. Shared
+  state stays opt-in.
 - `pace()` and `paced_get(url, timeout, params=None, headers=None)`: a caller's
   own archive.org requests (a snapshot read, say) can sit on the same shared
   clock, breaker and backoff as `check()` and `submit()`, so they count against
