@@ -12,6 +12,8 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-11
+
 ### Added
 - `request_counts()`: how many requests went to archive.org, by endpoint
   (`availability`, `cdx`, `save`, `job_status`, `user_status`,
@@ -252,6 +254,7 @@ async job-status polling, and an explicit archive-outcome vocabulary
 that distinguishes "we asked archive.org" from "archive.org confirmed it
 archived this."
 
+[0.5.1]: https://github.com/MHammett/spn-client/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/MHammett/spn-client/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MHammett/spn-client/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/MHammett/spn-client/compare/v0.3.0...v0.3.1
