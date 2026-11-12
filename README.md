@@ -183,6 +183,50 @@ one of those is set. With it:
 The file is plain SQLite, safe to delete between runs. If it cannot be opened
 or fails mid-run, the process logs a warning and goes back to pacing itself.
 
+`spn_client.default_shared_state_path()` returns one per-user file
+(`%LOCALAPPDATA%\spn-client\rate-limit.sqlite` on Windows, the XDG cache
+elsewhere), so separate projects share a clock without agreeing on a path:
+
+```python
+spn_client.use_shared_state(spn_client.default_shared_state_path())
+```
+
+### Your own archive.org requests
+
+A request you make yourself, such as reading a snapshot, comes from the same
+address and counts against the same limit. Put it on the same clock:
+
+```python
+resp = spn_client.paced_get(snapshot_url, timeout=30)   # paced, counted, feeds the breaker
+```
+
+If the fetch has to go through your own code, pace it and report the answer:
+
+```python
+if not spn_client.rate_limited_out():
+    spn_client.pace()
+    try:
+        resp = my_fetch(snapshot_url)
+    except Exception as exc:
+        spn_client.note_outcome(exc=exc)
+        raise
+    spn_client.note_outcome(status_code=resp.status_code)
+```
+
+`spn_client.breaker_reason()` says why the breaker is open: `"rate_limited"`,
+`"connection_refused"` or `"machine_wide"`.
+
+### How many requests you sent
+
+```python
+spn_client.request_counts()                    # this run: {"availability": 41, "save": 12, ...}
+spn_client.request_counts(machine_wide=True)   # every process on the machine, today (UTC)
+```
+
+Every attempt is counted, by endpoint. The machine-wide count needs shared
+state and is kept per day for 60 days. It is the number archive.org sees from
+your address, which no single run can know.
+
 ### Optional capture options
 
 ```python

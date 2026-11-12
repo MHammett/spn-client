@@ -42,7 +42,17 @@ CREATE TABLE IF NOT EXISTS clock (
 );
 INSERT OR IGNORE INTO clock VALUES (1, 0, 0, 0, 0, 0);
 CREATE TABLE IF NOT EXISTS refusals (at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS request_counts (
+    day      TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    n        INTEGER NOT NULL,
+    PRIMARY KEY (day, endpoint)
+);
 """
+
+#: Days of per-endpoint request counts kept in the file. Long enough to compare
+#: this month with last; short enough that the table stays a few hundred rows.
+COUNT_RETENTION_DAYS = 60
 
 #: A reserved slot further ahead than this is not a queue, it is a clock that
 #: moved: another process wrote its times before this machine's clock was set
@@ -53,6 +63,12 @@ MAX_PLAUSIBLE_WAIT_SECONDS = 600.0
 
 def _now() -> float:
     return time.time()
+
+
+def _day(at: float) -> str:
+    """The UTC date of ``at``. UTC, so processes in different time zones on a
+    shared file (a network home directory) agree which day it is."""
+    return time.strftime("%Y-%m-%d", time.gmtime(at))
 
 
 class SharedState:
@@ -175,6 +191,33 @@ class SharedState:
                     "UPDATE clock SET half_open = 0, closed_at = ? WHERE id = 1",
                     (now,),
                 )
+
+    def count_request(self, endpoint: str) -> None:
+        """Add one request to today's count for ``endpoint``."""
+        with self._write() as conn:
+            now = _now()
+            conn.execute(
+                "INSERT INTO request_counts VALUES (?, ?, 1) "
+                "ON CONFLICT (day, endpoint) DO UPDATE SET n = n + 1",
+                (_day(now), endpoint),
+            )
+            conn.execute(
+                "DELETE FROM request_counts WHERE day < ?",
+                (_day(now - COUNT_RETENTION_DAYS * 86400),),
+            )
+
+    def request_counts(self, day: str | None = None) -> dict[str, int]:
+        """Requests per endpoint from every process, for ``day`` (``YYYY-MM-DD``
+        in UTC; today by default)."""
+        conn = sqlite3.connect(self.path, timeout=30)
+        try:
+            rows = conn.execute(
+                "SELECT endpoint, n FROM request_counts WHERE day = ?",
+                (day or _day(_now()),),
+            ).fetchall()
+        finally:
+            conn.close()
+        return {endpoint: int(n) for endpoint, n in rows}
 
     def is_open(self) -> bool:
         """True while the breaker is open (not while it is half-open)."""

@@ -12,6 +12,19 @@ see `AGENTS.md` if you're an AI coding agent about to add an entry here.
 
 ## [Unreleased]
 
+### Added
+- `request_counts()`: how many requests went to archive.org, by endpoint
+  (`availability`, `cdx`, `save`, `job_status`, `user_status`,
+  `system_status`, and `caller` for snapshot reads and anything paced with
+  `pace()`). Every attempt counts, so a lookup that drew three 429s is three.
+  By default it covers this process since `reset_rate_limit_state()`.
+  `request_counts(machine_wide=True, day=None)` reads the shared file instead:
+  every process on the machine, per UTC day, kept for 60 days. Until now a
+  report could say what happened to each URL but not how many requests one
+  address sent in a day, which is the number archive.org limits. A shared
+  file created by 0.5.0 gains the table on first use; 0.5.0 processes sharing
+  it are unaffected and simply are not counted.
+
 ## [0.5.0] — 2026-11-11
 
 One machine, one polite client: pacing, backoff and the breaker can be shared
